@@ -11,21 +11,8 @@ pub(crate) const CHEAT_FUNCTION_TABLE: usize = 0x10065c358;
 pub(crate) const CHEAT_ACTIVE_FLAGS: usize = 0x10072dda8;
 pub(crate) const CHEAT_COUNT: usize = 111;
 
-extern "C" {
-    fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
-}
-
-fn game_slide() -> usize {
-    static SLIDE: Lazy<usize> = Lazy::new(|| unsafe {
-        let a = _dyld_get_image_vmaddr_slide(0).max(0) as usize;
-        let b = _dyld_get_image_vmaddr_slide(1).max(0) as usize;
-        a.min(b)
-    });
-    *SLIDE
-}
-
 pub(crate) fn absolute(address: usize) -> usize {
-    address + game_slide()
+    address + crate::jailed_runtime::game_slide()
 }
 
 // Every cheat slot is exposed. Entries without an official keyboard code are
