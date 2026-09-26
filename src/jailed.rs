@@ -486,28 +486,26 @@ extern "C" fn handle_cleo_touch(_this: &Object, _cmd: Sel, gesture: *mut Object)
             return;
         }
 
-        let point: CGPoint = msg_send![gesture, locationInView: view];
         let bounds: CGRect = msg_send![view, bounds];
 
         match state {
-            1 => crate::jailed_touch::touch_began(
-                point.x,
-                point.y,
-                bounds.size.width,
-                bounds.size.height,
-            ),
-            2 => crate::jailed_touch::touch_moved(
-                point.x,
-                point.y,
-                bounds.size.width,
-                bounds.size.height,
-            ),
-            3 | 4 | 5 => crate::jailed_touch::touch_ended(
-                point.x,
-                point.y,
-                bounds.size.width,
-                bounds.size.height,
-            ),
+            1 | 2 => {
+                let count: usize = msg_send![gesture, numberOfTouches];
+                let mut points = Vec::with_capacity(count.min(2));
+
+                for index in 0..count.min(2) {
+                    let point: CGPoint =
+                        msg_send![gesture, locationOfTouch: index inView: view];
+                    points.push((point.x, point.y));
+                }
+
+                crate::jailed_touch::touches_changed(
+                    &points,
+                    bounds.size.width,
+                    bounds.size.height,
+                );
+            }
+            3 | 4 | 5 => crate::jailed_touch::touches_ended(),
             _ => {}
         }
     }
@@ -643,6 +641,8 @@ fn install_swipe_gesture() {
             msg_send![touch, initWithTarget: target action: sel!(handleCleoTouch:)];
         let _: () = msg_send![touch, setMinimumPressDuration: 0.0f64];
         let _: () = msg_send![touch, setAllowableMovement: 10000.0f64];
+        let _: () = msg_send![touch, setMinimumNumberOfTouches: 1usize];
+        let _: () = msg_send![touch, setMaximumNumberOfTouches: 2usize];
         let _: () = msg_send![touch, setCancelsTouchesInView: false];
         let _: () = msg_send![touch, setDelegate: target];
         let _: () = msg_send![window, addGestureRecognizer: touch];
