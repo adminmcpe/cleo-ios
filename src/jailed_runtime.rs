@@ -1528,6 +1528,7 @@ fn end_game_session() {
     }
     crate::jailed::hide_android_menu();
     crate::jailed_touch::reset();
+    crate::jailed_cheats::clear_queue();
 }
 
 pub fn tick() {
@@ -1548,6 +1549,11 @@ pub fn tick() {
     if !now_in_game {
         return;
     }
+
+    // Execute built-in cheats only from the jailed game-runtime tick, after the
+    // UIKit overlay has closed. This keeps weapon/vehicle cheats on the main
+    // game thread instead of firing directly from a button callback.
+    crate::jailed_cheats::process_queue();
 
     let mut scripts = SCRIPTS.lock().unwrap();
 
