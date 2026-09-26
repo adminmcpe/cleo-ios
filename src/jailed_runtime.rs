@@ -9,6 +9,7 @@ use std::{
     collections::HashMap,
     ffi::{c_char, c_void, CStr, CString},
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -1023,6 +1024,7 @@ impl Script {
 
     fn stop_with_error(&mut self, message: String) {
         self.game.active = false;
+        runtime_log(&format!("[ERROR] {}: {}", self.name, message));
         self.error = Some(message);
     }
 
@@ -2264,6 +2266,20 @@ fn cleo_dir() -> PathBuf {
     path
 }
 
+fn runtime_log(message: &str) {
+    let root = cleo_dir();
+    let _ = fs::create_dir_all(&root);
+    let path = root.join("jailed_runtime.log");
+
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
 fn collect_fxt_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -2580,6 +2596,7 @@ pub fn activate_csi(index: usize) -> bool {
         script.game.active = true;
     }
 
+    runtime_log(&format!("[CSI] activated {}", script.name));
     true
 }
 
@@ -2591,6 +2608,11 @@ pub fn toggle_csa(index: usize) -> bool {
     };
 
     script.enabled = !script.enabled;
+    runtime_log(&format!(
+        "[CSA] {} -> {}",
+        script.name,
+        if script.enabled { "enabled" } else { "disabled" }
+    ));
 
     if script.enabled && in_game {
         script.reset(true);
@@ -2617,5 +2639,12 @@ pub fn is_in_game() -> bool {
 
 pub fn init() {
     reload_scripts();
+    runtime_log(&format!(
+        "[INIT] game_image={} slide={:#x} scripts={} csi={}",
+        game_image_index(),
+        game_slide(),
+        SCRIPTS.lock().unwrap().len(),
+        CSI_COUNT.load(Ordering::SeqCst),
+    ));
     INITIALISED.store(true, Ordering::SeqCst);
 }
