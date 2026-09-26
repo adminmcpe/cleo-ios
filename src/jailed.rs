@@ -63,6 +63,7 @@ const TAG_ANDROID_CLOSE: i64 = 19_999;
 static GESTURE_TARGET: OnceCell<usize> = OnceCell::new();
 static OVERLAY: AtomicUsize = AtomicUsize::new(0);
 static CONTENT_VIEW: AtomicUsize = AtomicUsize::new(0);
+static TAB_BUTTONS: Lazy<Mutex<[usize; 4]>> = Lazy::new(|| Mutex::new([0; 4]));
 static SELECTED_TAB: AtomicUsize = AtomicUsize::new(TAG_TAB_CSI as usize);
 static TIMER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static ANDROID_MENU_OVERLAY: AtomicUsize = AtomicUsize::new(0);
@@ -102,6 +103,50 @@ fn set_bg(view: *mut Object, white: f64, alpha: f64) {
     }
 }
 
+const IOS_CLEO_ROW_HEIGHT: f64 = 50.0;
+const IOS_CLEO_TAB_HEIGHT: f64 = 50.0;
+const IOS_CLEO_CLOSE_HEIGHT: f64 = 35.0;
+
+fn create_blur_view(frame: CGRect) -> *mut Object {
+    unsafe {
+        // CLEO iOS 2.6 uses UIBlurEffectStyle 3 (extra dark).
+        let effect: *mut Object = msg_send![class!(UIBlurEffect), effectWithStyle: 3u64];
+        let view: *mut Object = msg_send![class!(UIVisualEffectView), alloc];
+        let view: *mut Object = msg_send![view, initWithEffect: effect];
+        let _: () = msg_send![view, setFrame: frame];
+        view
+    }
+}
+
+fn set_tab_style(button: *mut Object, selected: bool) {
+    if button.is_null() {
+        return;
+    }
+
+    unsafe {
+        let text_alpha = if selected { 0.95 } else { 0.40 };
+        let background_alpha = if selected { 0.20 } else { 0.10 };
+
+        let title_colour: *mut Object =
+            msg_send![class!(UIColor), colorWithWhite: 1.0f64 alpha: text_alpha];
+        let background: *mut Object =
+            msg_send![class!(UIColor), colorWithWhite: 0.0f64 alpha: background_alpha];
+
+        let _: () = msg_send![button, setTitleColor: title_colour forState: 0u64];
+        let _: () = msg_send![button, setBackgroundColor: background];
+    }
+}
+
+fn refresh_tab_styles() {
+    let selected = SELECTED_TAB.load(Ordering::SeqCst) as i64;
+    let tags = [TAG_TAB_CSI, TAG_TAB_CSA, TAG_TAB_CHEATS, TAG_TAB_OPTIONS];
+    let buttons = TAB_BUTTONS.lock().unwrap();
+
+    for (index, button) in buttons.iter().enumerate() {
+        set_tab_style(*button as *mut Object, selected == tags[index]);
+    }
+}
+
 fn add_label(
     parent: *mut Object,
     frame: CGRect,
@@ -134,35 +179,35 @@ fn add_label(
 
 fn add_row(parent: *mut Object, y: f64, width: f64, title: &str, detail: &str, value: &str) {
     unsafe {
-        let row = CGRect::new(width * 0.03, y, width * 0.94, 72.0);
+        let row = CGRect::new(0.0, y, width, IOS_CLEO_ROW_HEIGHT);
 
         let container: *mut Object = msg_send![class!(UIView), alloc];
         let container: *mut Object = msg_send![container, initWithFrame: row];
-        set_bg(container, 1.0, 0.08);
+        set_bg(container, 0.0, 0.0);
 
         add_label(
             container,
-            CGRect::new(14.0, 7.0, row.size.width * 0.58, 27.0),
+            CGRect::new(width * 0.05, 2.0, width * 0.58, 27.0),
             title,
-            18.0,
+            16.0,
             0,
-            0.96,
+            0.95,
         );
         add_label(
             container,
-            CGRect::new(14.0, 35.0, row.size.width * 0.68, 28.0),
+            CGRect::new(width * 0.05, 25.0, width * 0.72, 20.0),
             detail,
-            12.0,
+            11.0,
             0,
-            0.58,
+            0.95,
         );
         add_label(
             container,
-            CGRect::new(row.size.width * 0.70, 7.0, row.size.width * 0.26, 54.0),
+            CGRect::new(width * 0.63, 2.0, width * 0.32, 27.0),
             value,
-            15.0,
+            16.0,
             2,
-            0.90,
+            0.95,
         );
 
         let _: () = msg_send![parent, addSubview: container];
@@ -181,36 +226,36 @@ fn add_action_row(
     tag: i64,
 ) {
     unsafe {
-        let row = CGRect::new(width * 0.03, y, width * 0.94, 72.0);
+        let row = CGRect::new(0.0, y, width, IOS_CLEO_ROW_HEIGHT);
 
         let button: *mut Object = msg_send![class!(UIButton), alloc];
         let button: *mut Object = msg_send![button, initWithFrame: row];
         let _: () = msg_send![button, setTag: tag];
-        set_bg(button, 1.0, 0.08);
+        set_bg(button, 0.0, 0.0);
 
         add_label(
             button,
-            CGRect::new(14.0, 7.0, row.size.width * 0.58, 27.0),
+            CGRect::new(width * 0.05, 2.0, width * 0.58, 27.0),
             title,
-            18.0,
+            16.0,
             0,
-            0.96,
+            0.95,
         );
         add_label(
             button,
-            CGRect::new(14.0, 35.0, row.size.width * 0.68, 28.0),
+            CGRect::new(width * 0.05, 25.0, width * 0.72, 20.0),
             detail,
-            12.0,
+            11.0,
             0,
-            0.58,
+            0.95,
         );
         add_label(
             button,
-            CGRect::new(row.size.width * 0.70, 7.0, row.size.width * 0.26, 54.0),
+            CGRect::new(width * 0.63, 2.0, width * 0.32, 27.0),
             value,
-            15.0,
+            16.0,
             2,
-            0.90,
+            0.95,
         );
 
         let _: () = msg_send![
@@ -242,7 +287,7 @@ fn add_script_rows(parent: *mut Object, width: f64, extension: &str) {
     if scripts.is_empty() {
         add_label(
             parent,
-            CGRect::new(width * 0.06, 95.0, width * 0.88, 100.0),
+            CGRect::new(width * 0.06, 20.0, width * 0.88, 100.0),
             &format!("No .{} scripts found in Documents/CLEO.", extension),
             17.0,
             1,
@@ -257,7 +302,7 @@ fn add_script_rows(parent: *mut Object, width: f64, extension: &str) {
         .unwrap_or(0) as *mut Object;
 
     let row_count = scripts.len();
-    let mut y = 78.0;
+    let mut y = 0.0;
     for (index, script) in scripts.into_iter().enumerate() {
         let (detail, value) = if let Some(error) = &script.error {
             (error.as_str(), "Error")
@@ -289,10 +334,10 @@ fn add_script_rows(parent: *mut Object, width: f64, extension: &str) {
             value,
             tag,
         );
-        y += 78.0;
+        y += IOS_CLEO_ROW_HEIGHT;
     }
 
-    set_scroll_height(parent, width, (row_count as f64 * 78.0 + 90.0).max(620.0));
+    set_scroll_height(parent, width, (row_count as f64 * IOS_CLEO_ROW_HEIGHT).max(IOS_CLEO_ROW_HEIGHT));
 }
 
 fn add_cheat_rows(parent: *mut Object, width: f64) {
@@ -301,7 +346,7 @@ fn add_cheat_rows(parent: *mut Object, width: f64) {
     if cheats.is_empty() {
         add_label(
             parent,
-            CGRect::new(width * 0.06, 95.0, width * 0.88, 100.0),
+            CGRect::new(width * 0.06, 20.0, width * 0.88, 100.0),
             "No named cheats found.",
             17.0,
             1,
@@ -338,10 +383,10 @@ fn add_cheat_rows(parent: *mut Object, width: f64) {
             TAG_CHEAT_BASE + index as i64,
         );
 
-        y += 78.0;
+        y += IOS_CLEO_ROW_HEIGHT;
     }
 
-    set_scroll_height(parent, width, (row_count as f64 * 78.0 + 90.0).max(620.0));
+    set_scroll_height(parent, width, (row_count as f64 * IOS_CLEO_ROW_HEIGHT).max(IOS_CLEO_ROW_HEIGHT));
 }
 
 fn clear_content() {
@@ -371,6 +416,7 @@ fn render_selected_tab() {
     }
 
     clear_content();
+    refresh_tab_styles();
 
     unsafe {
         let bounds: CGRect = msg_send![content, bounds];
@@ -379,51 +425,13 @@ fn render_selected_tab() {
         set_scroll_height(content, width, bounds.size.height);
 
         match SELECTED_TAB.load(Ordering::SeqCst) as i64 {
-            TAG_TAB_CSI => {
-                add_label(
-                    content,
-                    CGRect::new(width * 0.04, 14.0, width * 0.92, 48.0),
-                    "CSI Scripts",
-                    28.0,
-                    0,
-                    1.0,
-                );
-                add_script_rows(content, width, "csi");
-            }
-            TAG_TAB_CSA => {
-                add_label(
-                    content,
-                    CGRect::new(width * 0.04, 14.0, width * 0.92, 48.0),
-                    "CSA Scripts",
-                    28.0,
-                    0,
-                    1.0,
-                );
-                add_script_rows(content, width, "csa");
-            }
-            TAG_TAB_CHEATS => {
-                add_label(
-                    content,
-                    CGRect::new(width * 0.04, 14.0, width * 0.92, 48.0),
-                    "Cheats",
-                    28.0,
-                    0,
-                    1.0,
-                );
-                add_cheat_rows(content, width);
-            }
+            TAG_TAB_CSI => add_script_rows(content, width, "csi"),
+            TAG_TAB_CSA => add_script_rows(content, width, "csa"),
+            TAG_TAB_CHEATS => add_cheat_rows(content, width),
             _ => {
-                add_label(
-                    content,
-                    CGRect::new(width * 0.04, 14.0, width * 0.92, 48.0),
-                    "Options",
-                    28.0,
-                    0,
-                    1.0,
-                );
                 add_row(
                     content,
-                    78.0,
+                    0.0,
                     width,
                     "Menu Gesture",
                     "Gesture used to open the CLEO menu",
@@ -431,7 +439,7 @@ fn render_selected_tab() {
                 );
                 add_row(
                     content,
-                    156.0,
+                    IOS_CLEO_ROW_HEIGHT,
                     width,
                     "Runtime Mode",
                     "UIKit timer + native SCM opcode handlers",
@@ -439,12 +447,13 @@ fn render_selected_tab() {
                 );
                 add_row(
                     content,
-                    234.0,
+                    IOS_CLEO_ROW_HEIGHT * 2.0,
                     width,
                     "CLEO Base",
                     "Source branch used for this port",
                     "2.6.0",
                 );
+                set_scroll_height(content, width, IOS_CLEO_ROW_HEIGHT * 3.0);
             }
         }
     }
@@ -671,17 +680,19 @@ fn add_tab_button(
     frame: CGRect,
     title: &str,
     tag: i64,
-) {
+) -> *mut Object {
     unsafe {
         let button: *mut Object = msg_send![class!(UIButton), alloc];
         let button: *mut Object = msg_send![button, initWithFrame: frame];
         let _: () = msg_send![button, setTitle: ns_string(title) forState: 0u64];
         let _: () = msg_send![button, setTag: tag];
-        set_bg(button, 1.0, 0.12);
 
         let label: *mut Object = msg_send![button, titleLabel];
-        let font: *mut Object = msg_send![class!(UIFont), boldSystemFontOfSize: 15.0f64];
+        let font: *mut Object = msg_send![class!(UIFont), boldSystemFontOfSize: 16.0f64];
         let _: () = msg_send![label, setFont: font];
+        let _: () = msg_send![label, setAdjustsFontSizeToFitWidth: true];
+
+        set_tab_style(button, SELECTED_TAB.load(Ordering::SeqCst) as i64 == tag);
 
         let _: () = msg_send![
             button,
@@ -692,6 +703,7 @@ fn add_tab_button(
 
         let _: () = msg_send![parent, addSubview: button];
         let _: () = msg_send![button, release];
+        button
     }
 }
 
@@ -879,10 +891,8 @@ fn show_menu() {
         }
 
         let bounds: CGRect = msg_send![window, bounds];
-
-        let overlay: *mut Object = msg_send![class!(UIView), alloc];
-        let overlay: *mut Object = msg_send![overlay, initWithFrame: bounds];
-        set_bg(overlay, 0.0, 0.78);
+        let blur_view = create_blur_view(bounds);
+        let menu_parent: *mut Object = msg_send![blur_view, contentView];
 
         let target = GESTURE_TARGET
             .get()
@@ -892,46 +902,39 @@ fn show_menu() {
                 t as usize
             }) as *mut Object;
 
-        let tab_h = 54.0;
-        let close_h = 58.0;
         let tab_w = bounds.size.width / 4.0;
+        let tags = [TAG_TAB_CSI, TAG_TAB_CSA, TAG_TAB_CHEATS, TAG_TAB_OPTIONS];
+        let titles = ["CSI", "CSA", "Cheats", "Options"];
+        let mut buttons = [0usize; 4];
 
-        add_tab_button(
-            overlay,
-            target,
-            CGRect::new(0.0, 0.0, tab_w, tab_h),
-            "CSI",
-            TAG_TAB_CSI,
-        );
-        add_tab_button(
-            overlay,
-            target,
-            CGRect::new(tab_w, 0.0, tab_w, tab_h),
-            "CSA",
-            TAG_TAB_CSA,
-        );
-        add_tab_button(
-            overlay,
-            target,
-            CGRect::new(tab_w * 2.0, 0.0, tab_w, tab_h),
-            "Cheats",
-            TAG_TAB_CHEATS,
-        );
-        add_tab_button(
-            overlay,
-            target,
-            CGRect::new(tab_w * 3.0, 0.0, tab_w, tab_h),
-            "Options",
-            TAG_TAB_OPTIONS,
-        );
+        for index in 0..4 {
+            let button = add_tab_button(
+                menu_parent,
+                target,
+                CGRect::new(
+                    tab_w * index as f64,
+                    0.0,
+                    tab_w,
+                    IOS_CLEO_TAB_HEIGHT,
+                ),
+                titles[index],
+                tags[index],
+            );
+            buttons[index] = button as usize;
+        }
+        *TAB_BUTTONS.lock().unwrap() = buttons;
 
-        let content_frame =
-            CGRect::new(0.0, tab_h, bounds.size.width, bounds.size.height - tab_h - close_h);
+        let content_frame = CGRect::new(
+            0.0,
+            IOS_CLEO_TAB_HEIGHT,
+            bounds.size.width,
+            bounds.size.height - IOS_CLEO_TAB_HEIGHT - IOS_CLEO_CLOSE_HEIGHT,
+        );
         let content: *mut Object = msg_send![class!(UIScrollView), alloc];
         let content: *mut Object = msg_send![content, initWithFrame: content_frame];
-        set_bg(content, 0.0, 0.16);
+        set_bg(content, 0.0, 0.20);
         let _: () = msg_send![content, setAlwaysBounceVertical: true];
-        let _: () = msg_send![overlay, addSubview: content];
+        let _: () = msg_send![menu_parent, addSubview: content];
         CONTENT_VIEW.store(content as usize, Ordering::SeqCst);
         let _: () = msg_send![content, release];
 
@@ -940,20 +943,20 @@ fn show_menu() {
             close,
             initWithFrame: CGRect::new(
                 0.0,
-                bounds.size.height - close_h,
+                bounds.size.height - IOS_CLEO_CLOSE_HEIGHT,
                 bounds.size.width,
-                close_h
+                IOS_CLEO_CLOSE_HEIGHT
             )
         ];
         let _: () = msg_send![close, setTitle: ns_string("Close") forState: 0u64];
         let _: () = msg_send![close, setTag: TAG_CLOSE];
 
         let red: *mut Object =
-            msg_send![class!(UIColor), colorWithRed: 1.0f64 green: 0.23f64 blue: 0.30f64 alpha: 0.38f64];
+            msg_send![class!(UIColor), colorWithRed: 1.0f64 green: 0.23f64 blue: 0.30f64 alpha: 0.35f64];
         let _: () = msg_send![close, setBackgroundColor: red];
 
         let close_label: *mut Object = msg_send![close, titleLabel];
-        let close_font: *mut Object = msg_send![class!(UIFont), boldSystemFontOfSize: 18.0f64];
+        let close_font: *mut Object = msg_send![class!(UIFont), boldSystemFontOfSize: 20.0f64];
         let _: () = msg_send![close_label, setFont: close_font];
 
         let _: () = msg_send![
@@ -962,13 +965,12 @@ fn show_menu() {
             action: sel!(handleCleoMenuButton:)
             forControlEvents: 1u64 << 6
         ];
-
-        let _: () = msg_send![overlay, addSubview: close];
+        let _: () = msg_send![menu_parent, addSubview: close];
         let _: () = msg_send![close, release];
 
-        let _: () = msg_send![window, addSubview: overlay];
+        let _: () = msg_send![window, addSubview: blur_view];
 
-        OVERLAY.store(overlay as usize, Ordering::SeqCst);
+        OVERLAY.store(blur_view as usize, Ordering::SeqCst);
         render_selected_tab();
     }
 }
@@ -976,6 +978,7 @@ fn show_menu() {
 fn hide_menu() {
     let current = OVERLAY.swap(0, Ordering::SeqCst);
     CONTENT_VIEW.store(0, Ordering::SeqCst);
+    *TAB_BUTTONS.lock().unwrap() = [0; 4];
 
     if current == 0 {
         return;
