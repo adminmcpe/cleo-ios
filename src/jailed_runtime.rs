@@ -145,6 +145,12 @@ impl Script {
     }
 
     fn update_one(&mut self) -> bool {
+        let offset = self.game.ip as usize - self.game.base_ip as usize;
+        if offset + 2 > self.bytes.len() {
+            self.stop_with_error("Script instruction pointer moved past end of file".to_string());
+            return true;
+        }
+
         let op_as_written = unsafe {
             let op = self.game.ip.read();
             self.game.ip = self.game.ip.add(1);
@@ -162,7 +168,12 @@ impl Script {
 
         // These are Android-specific / unimplemented CLEO opcodes in the original
         // iOS checker. Stop cleanly instead of letting the game execute them.
-        if matches!(opcode, 0x0dd0..=0x0ddb | 0x0dde | 0x0de1..=0x0df6) {
+        if matches!(
+            opcode,
+            0x00e1
+                | 0x0dd0..=0x0dde
+                | 0x0de0..=0x0df6
+        ) {
             self.stop_with_error(format!("Unsupported iOS opcode {opcode:#06x}"));
             return true;
         }
