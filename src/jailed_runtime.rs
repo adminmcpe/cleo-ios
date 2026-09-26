@@ -53,6 +53,18 @@ fn absolute(address: usize) -> usize {
     address + game_slide()
 }
 
+fn android_str_hash(value: &str) -> u32 {
+    let mut hash = 0u32;
+    for byte in value.bytes() {
+        hash = hash.wrapping_add(byte as u32);
+        hash = hash.wrapping_add(hash << 10);
+        hash ^= hash >> 6;
+    }
+    hash = hash.wrapping_add(hash << 3);
+    hash ^= hash >> 11;
+    hash.wrapping_add(hash << 15)
+}
+
 unsafe fn read_global<T: Copy>(address: usize) -> T {
     (absolute(address) as *const T).read()
 }
@@ -471,20 +483,72 @@ impl Script {
                     return Some(true);
                 };
 
-                let Some((real, writable)) = self.android_symbol(&name) else {
-                    self.stop_with_error(format!("Android symbol not found on iOS: {name}"));
+                let Some((real, writable, span)) = self.android_symbol(&name) else {
+                    self.stop_with_error(format!(
+                        "Android symbol needs iOS adapter: {name}"
+                    ));
                     return Some(true);
                 };
 
-                let token = register_symbol_region(&name, real, writable);
+                let token = register_symbol_region(&name, real, writable, span);
                 unsafe {
                     destination.write(token);
                 }
                 Some(false)
             }
 
-            // get_platform. Return Android intentionally: compatibility scripts
-            // should follow their Android branch rather than an unknown-platform path.
+            // context_call
+            0x0dd2 => {
+                self.collect_value_args(1);
+                let address = unsafe { Self::script_params().read() };
+                let args = self.context[..8].to_vec();
+
+                let Some(result) = self.call_integer_function(address, &args) else {
+                    self.stop_with_error(format!(
+                        "Android context call target {address:#010x} is not callable on iOS"
+                    ));
+                    return Some(true);
+                };
+
+                self.context[0] = result;
+                Some(false)
+            }
+
+            // context_set_reg
+            0x0dd3 => {
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                let reg = unsafe { params.read() } as usize;
+                let value = unsafe { params.add(1).read() } as u64;
+
+                if reg >= self.context.len() {
+                    self.stop_with_error(format!("Android context register {reg} is invalid"));
+                    return Some(true);
+                }
+
+                self.context[reg] = value;
+                Some(false)
+            }
+
+            // context_get_reg
+            0x0dd4 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(1);
+                let reg = unsafe { Self::script_params().read() } as usize;
+
+                if reg >= self.context.len() {
+                    self.stop_with_error(format!("Android context register {reg} is invalid"));
+                    return Some(true);
+                }
+
+                unsafe {
+                    destination.write(self.context[reg] as u32);
+                }
+                Some(false)
+            }
+
+            // get_platform. Report Android for compatibility so scripts follow
+            // their Android code path, which this module translates to iOS.
             0x0dd5 => {
                 let destination = self.read_variable_arg::<*mut u32>();
                 unsafe {
@@ -493,11 +557,21 @@ impl Script {
                 Some(false)
             }
 
-            // get_game_version. CLEO Android uses 17 for GTASA 2.00-or-higher.
+            // get_game_version. 17 = GTASA 2.00-or-higher in CLEO Android.
             0x0dd6 => {
                 let destination = self.read_variable_arg::<*mut u32>();
                 unsafe {
                     destination.write(17);
+                }
+                Some(false)
+            }
+
+            // get_image_base. This is a virtual Android image token, not an iOS
+            // pointer. Fixed Android offsets still require a translation adapter.
+            0x0dd7 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                unsafe {
+                    destination.write(ANDROID_IMAGE_VBASE);
                 }
                 Some(false)
             }
@@ -517,9 +591,9 @@ impl Script {
                 }
 
                 if add_image_base {
-                    self.stop_with_error(
-                        "Android 0DD8 add_ib=1 needs an iOS address translation".to_string(),
-                    );
+                    self.stop_with_error(format!(
+                        "Android fixed image offset {address:#x} needs an iOS translation"
+                    ));
                     return Some(true);
                 }
 
@@ -542,8 +616,7 @@ impl Script {
                 Some(false)
             }
 
-            // write_mem_addr. Script-local data is writable now; writes into GTA
-            // symbols stay blocked until their segment protection is verified.
+            // write_mem_addr
             0x0dd9 => {
                 self.collect_value_args(5);
                 let params = Self::script_params();
@@ -558,9 +631,9 @@ impl Script {
                 }
 
                 if add_image_base {
-                    self.stop_with_error(
-                        "Android 0DD9 add_ib=1 needs an iOS address translation".to_string(),
-                    );
+                    self.stop_with_error(format!(
+                        "Android fixed image offset {address:#x} needs an iOS translation"
+                    ));
                     return Some(true);
                 }
 
@@ -573,7 +646,7 @@ impl Script {
 
                 if !writable {
                     self.stop_with_error(
-                        "Android 0DD9 tried to write an unverified iOS symbol".to_string(),
+                        "Android 0DD9 tried to write an unverified iOS region".to_string(),
                     );
                     return Some(true);
                 }
@@ -584,6 +657,51 @@ impl Script {
                         destination,
                         size,
                     );
+                }
+                Some(false)
+            }
+
+            // search_mem. Android machine-code signatures normally do not match
+            // arm64 iOS, but iOS signatures are supported by the compatibility scanner.
+            0x0dda => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                let pattern_address = unsafe { params.read() };
+                let index = unsafe { params.add(1).read() } as usize;
+
+                let Some(pattern) = self.read_virtual_c_string(pattern_address) else {
+                    self.stop_with_error("Android 0DDA received an invalid pattern string".to_string());
+                    return Some(true);
+                };
+
+                let value = if let Some(real) = find_ios_pattern(&pattern, index) {
+                    register_symbol_region(
+                        &format!("pattern:{pattern}:{index}"),
+                        real,
+                        false,
+                        0x10000,
+                    )
+                } else {
+                    0
+                };
+
+                unsafe {
+                    destination.write(value);
+                }
+                Some(false)
+            }
+
+            // get_game_ver_ex. Report a stable Android-compatible GTASA 2.x identity.
+            0x0ddb => {
+                let id = self.read_variable_arg::<*mut u32>();
+                let version = self.read_variable_arg::<*mut u32>();
+                let version_code = self.read_variable_arg::<*mut u32>();
+
+                unsafe {
+                    id.write(android_str_hash("com.rockstargames.gtasa"));
+                    version.write(android_str_hash("2.00"));
+                    version_code.write(20);
                 }
                 Some(false)
             }
@@ -610,15 +728,257 @@ impl Script {
                 Some(false)
             }
 
-            // Known Android CLEO opcodes not ported yet. Keep the error explicit so
-            // each script tells us exactly what compatibility work remains.
-            0x0dd2..=0x0dd4
-            | 0x0dd7
-            | 0x0dda..=0x0ddb
-            | 0x0dde
-            | 0x0de0..=0x0df6 => {
-                self.stop_with_error(format!("Android CLEO opcode {opcode:#06x} not ported yet"));
-                Some(true)
+            // call_func. Supports the integer/pointer ABI directly. Android-style
+            // floating-point varargs need a dedicated arm64 FP trampoline and are
+            // rejected instead of being called with the wrong ABI.
+            0x0dde => {
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                let address = unsafe { params.read() };
+                let add_image_base = unsafe { params.add(1).read() } != 0;
+
+                if add_image_base {
+                    self.stop_with_error(
+                        "Android 0DDE add_ib=1 needs an iOS function translation".to_string(),
+                    );
+                    return Some(true);
+                }
+
+                let mut args: Vec<u64> = Vec::new();
+                let mut result_ptr: Option<*mut u32> = None;
+
+                loop {
+                    let Some(kind) = self.read_8byte_string_param() else {
+                        self.stop_with_error(
+                            "Android 0DDE has an invalid typed parameter list".to_string(),
+                        );
+                        return Some(true);
+                    };
+
+                    let Some(kind) = kind else {
+                        break;
+                    };
+
+                    match kind.to_ascii_lowercase().as_str() {
+                        "i" => {
+                            self.collect_value_args(1);
+                            args.push(unsafe { Self::script_params().read() } as u64);
+                        }
+                        "ref" => {
+                            let ptr = self.read_variable_arg::<*mut u32>();
+                            args.push(ptr as usize as u64);
+                        }
+                        "resi" => {
+                            result_ptr = Some(self.read_variable_arg::<*mut u32>());
+                        }
+                        "f" | "resf" => {
+                            self.stop_with_error(
+                                "Android 0DDE floating-point ABI is not ported yet".to_string(),
+                            );
+                            return Some(true);
+                        }
+                        other => {
+                            self.stop_with_error(format!(
+                                "Android 0DDE unknown parameter type '{other}'"
+                            ));
+                            return Some(true);
+                        }
+                    }
+
+                    if args.len() > 8 {
+                        self.stop_with_error(
+                            "Android 0DDE currently supports up to 8 integer/pointer arguments"
+                                .to_string(),
+                        );
+                        return Some(true);
+                    }
+                }
+
+                let Some(result) = self.call_integer_function(address, &args) else {
+                    self.stop_with_error(format!(
+                        "Android 0DDE target {address:#010x} is not callable on iOS"
+                    ));
+                    return Some(true);
+                };
+
+                if let Some(ptr) = result_ptr {
+                    unsafe {
+                        ptr.write(result as u32);
+                    }
+                }
+
+                Some(false)
+            }
+
+            // get_touch_point_state
+            0x0de0 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                let zone = unsafe { params.read() };
+                let min_time = unsafe { params.add(1).read() };
+
+                unsafe {
+                    destination.write(
+                        crate::jailed_touch::point_touched_timed(zone, min_time) as u32
+                    );
+                }
+                Some(false)
+            }
+
+            // get_touch_slide_state
+            0x0de1 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(4);
+                let params = Self::script_params();
+                let from = unsafe { params.read() };
+                let to = unsafe { params.add(1).read() };
+                let min_time = unsafe { params.add(2).read() };
+                let max_time = unsafe { params.add(3).read() };
+
+                unsafe {
+                    destination.write(
+                        crate::jailed_touch::slide_done(from, to, min_time, max_time) as u32
+                    );
+                }
+                Some(false)
+            }
+
+            // Android menu/back button state.
+            0x0de2 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                unsafe {
+                    destination.write(crate::jailed_touch::menu_button_state() as u32);
+                }
+                Some(false)
+            }
+
+            0x0de3 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(1);
+                let min_time = unsafe { Self::script_params().read() };
+                unsafe {
+                    destination.write(
+                        crate::jailed_touch::menu_button_pressed_timed(min_time) as u32
+                    );
+                }
+                Some(false)
+            }
+
+            // PSP control opcodes are meaningful only on PSP. Android CLEO returns 0.
+            0x0de4 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(1);
+                unsafe { destination.write(0); }
+                Some(false)
+            }
+
+            0x0de5 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(2);
+                unsafe { destination.write(0); }
+                Some(false)
+            }
+
+            // invokable_script_stats
+            0x0dee => {
+                let count_ptr = self.read_variable_arg::<*mut u32>();
+                let page_ptr = self.read_variable_arg::<*mut u32>();
+                let count = CSI_COUNT.load(Ordering::SeqCst);
+                unsafe {
+                    count_ptr.write(count);
+                    page_ptr.write(count / 12 + 1);
+                }
+                Some(false)
+            }
+
+            // start_invokable_script. Requests are deferred until the current
+            // script iteration finishes so we never recursively lock SCRIPTS.
+            0x0def => {
+                let result = self.read_variable_arg::<*mut i32>();
+                self.collect_value_args(1);
+                let id = unsafe { Self::script_params().read() } as usize;
+                PENDING_INVOKES.lock().unwrap().push(id);
+                unsafe { result.write(0); }
+                Some(false)
+            }
+
+            // Android CLEO's "show menu arrow" hint is not needed on iOS.
+            0x0df0 | 0x0df1 => Some(false),
+
+            // create_menu
+            0x0df2 => {
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                let mut address = unsafe { params.read() };
+                let mut item_count = unsafe { params.add(1).read() } as usize;
+
+                let Some(flags) = self.read_virtual_u8(address) else {
+                    self.stop_with_error("Android 0DF2 menu descriptor is invalid".to_string());
+                    return Some(true);
+                };
+                address = address.wrapping_add(4);
+
+                let Some(title) = self.read_virtual_c_string_advance(&mut address) else {
+                    self.stop_with_error("Android 0DF2 menu title is invalid".to_string());
+                    return Some(true);
+                };
+                let Some(close) = self.read_virtual_c_string_advance(&mut address) else {
+                    self.stop_with_error("Android 0DF2 close title is invalid".to_string());
+                    return Some(true);
+                };
+
+                let use_gxt = flags & 1 != 0;
+                let mut items = Vec::new();
+
+                while item_count > 0 {
+                    let Some(item) = self.read_virtual_c_string_advance(&mut address) else {
+                        break;
+                    };
+                    if item.is_empty() {
+                        break;
+                    }
+
+                    items.push(if use_gxt {
+                        Self::translate_fxt(&item)
+                    } else {
+                        item
+                    });
+                    item_count -= 1;
+                }
+
+                crate::jailed::show_android_menu(title, close, items);
+                Some(false)
+            }
+
+            0x0df3 => {
+                crate::jailed::hide_android_menu();
+                Some(false)
+            }
+
+            0x0df4 => {
+                let destination = self.read_variable_arg::<*mut i32>();
+                self.collect_value_args(1);
+                let max_time = unsafe { Self::script_params().read() };
+                unsafe {
+                    destination.write(crate::jailed::android_menu_take_selected(max_time));
+                }
+                Some(false)
+            }
+
+            0x0df5 => {
+                self.collect_value_args(1);
+                let index = unsafe { Self::script_params().read() as i32 };
+                crate::jailed::android_menu_set_active(index);
+                Some(false)
+            }
+
+            0x0df6 => {
+                let destination = self.read_variable_arg::<*mut i32>();
+                unsafe {
+                    destination.write(crate::jailed::android_menu_get_active());
+                }
+                Some(false)
             }
 
             _ => None,
@@ -651,9 +1011,11 @@ impl Script {
             return can_interrupt;
         }
 
-        // The game's touch-zone opcode needs its own jailed UIKit translation.
+        // iOS CLEO touch-zone opcode. The second parameter is the CLEO zone.
         if opcode == 0x00e1 {
-            self.stop_with_error("iOS touch-zone opcode 0x00e1 not ported yet".to_string());
+            self.collect_value_args(2);
+            let zone = unsafe { Self::script_params().add(1).read() };
+            self.update_bool_flag(crate::jailed_touch::zone_pressed(zone));
             return true;
         }
 
@@ -705,6 +1067,7 @@ impl Script {
 static SCRIPTS: Lazy<Mutex<Vec<Script>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static IN_GAME: AtomicBool = AtomicBool::new(false);
 static INITIALISED: AtomicBool = AtomicBool::new(false);
+static CSI_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn cleo_dir() -> PathBuf {
     let mut path = std::env::temp_dir();
