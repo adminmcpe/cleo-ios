@@ -758,24 +758,22 @@ fn add_android_menu_button(
     unsafe {
         let button: *mut Object = msg_send![class!(UIButton), alloc];
         let button: *mut Object = msg_send![button, initWithFrame: frame];
-        let _: () = msg_send![button, setTitle: ns_string(title) forState: 0u64];
+        let _: () = msg_send![button, setTitle: ns_string("") forState: 0u64];
         let _: () = msg_send![button, setTag: tag];
         set_bg(button, 1.0, 0.10);
 
-        // UIButton's inherited/default title colour is not reliable over our
-        // dark compatibility overlay on recent iOS versions. Force readable
-        // colours explicitly for Android CLEO menus.
-        let normal_colour: *mut Object =
-            msg_send![class!(UIColor), colorWithWhite: 1.0f64 alpha: 0.96f64];
-        let pressed_colour: *mut Object =
-            msg_send![class!(UIColor), colorWithWhite: 1.0f64 alpha: 1.0f64];
-        let _: () = msg_send![button, setTitleColor: normal_colour forState: 0u64];
-        let _: () = msg_send![button, setTitleColor: pressed_colour forState: 1u64];
-
-        let label: *mut Object = msg_send![button, titleLabel];
-        let font: *mut Object = msg_send![class!(UIFont), systemFontOfSize: 17.0f64];
-        let _: () = msg_send![label, setFont: font];
-        let _: () = msg_send![label, setNumberOfLines: 1i64];
+        // Render Android CLEO menu text with a UILabel instead of UIButton's
+        // titleLabel. The latter can inherit a tint/configuration that makes
+        // titles effectively invisible on modern iOS. UILabel rendering is the
+        // same reliable path used by our main jailed CLEO menu.
+        add_label(
+            button,
+            CGRect::new(8.0, 0.0, frame.size.width - 16.0, frame.size.height),
+            title,
+            17.0,
+            1,
+            0.96,
+        );
 
         let _: () = msg_send![
             button,
@@ -870,14 +868,19 @@ pub fn show_android_menu(title: String, close_title: String, items: Vec<String>)
                 close_h,
             )
         ];
-        let _: () = msg_send![close, setTitle: ns_string(&close_title) forState: 0u64];
+        let _: () = msg_send![close, setTitle: ns_string("") forState: 0u64];
         let _: () = msg_send![close, setTag: TAG_ANDROID_CLOSE];
-        let close_colour: *mut Object =
-            msg_send![class!(UIColor), colorWithWhite: 1.0f64 alpha: 1.0f64];
-        let _: () = msg_send![close, setTitleColor: close_colour forState: 0u64];
         let red: *mut Object =
             msg_send![class!(UIColor), colorWithRed: 1.0f64 green: 0.20f64 blue: 0.25f64 alpha: 0.36f64];
         let _: () = msg_send![close, setBackgroundColor: red];
+        add_label(
+            close,
+            CGRect::new(8.0, 0.0, bounds.size.width - 16.0, close_h),
+            &close_title,
+            18.0,
+            1,
+            1.0,
+        );
         let _: () = msg_send![
             close,
             addTarget: target
