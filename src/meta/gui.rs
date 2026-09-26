@@ -416,6 +416,9 @@ fn legal_splash_did_load(this: *mut Object, _sel: Sel) {
         let _: () = msg_send![label, release];
     }
 
+    #[cfg(feature = "jailed")]
+    crate::jailed::install_swipe_gesture(unsafe { msg_send![this, view] });
+
     log::info!("Finished setting up splash screen.");
 }
 
