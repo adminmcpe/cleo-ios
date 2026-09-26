@@ -2,6 +2,11 @@ name: Inspect public GTA iOS Ghidra symbols
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - jailed-menu-fix
+    paths:
+      - .github/workflows/inspect-ghidra.yml
 
 jobs:
   inspect:
