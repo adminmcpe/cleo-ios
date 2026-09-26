@@ -874,6 +874,7 @@ enum NativeArg {
 impl Script {
     fn new(kind: Kind, bytes: Vec<u8>, name: String) -> Self {
         let ip = bytes.as_ptr().cast::<u16>();
+        let special = SpecialScript::from_name(&name);
 
         Self {
             kind,
@@ -884,7 +885,7 @@ impl Script {
             error: None,
             virtual_base: NEXT_SCRIPT_VBASE.fetch_add(SCRIPT_VIRTUAL_STRIDE, Ordering::SeqCst),
             context: [0; 32],
-            special: SpecialScript::from_name(&name),
+            special,
         }
     }
 
