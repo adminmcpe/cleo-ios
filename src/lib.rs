@@ -23,6 +23,8 @@ mod meta;
 
 #[cfg(feature = "jailed")]
 mod jailed;
+#[cfg(feature = "jailed")]
+mod jailed_runtime;
 
 #[cfg(not(feature = "jailed"))]
 mod targets {
