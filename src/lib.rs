@@ -25,6 +25,8 @@ mod meta;
 mod jailed;
 #[cfg(feature = "jailed")]
 mod jailed_runtime;
+#[cfg(feature = "jailed")]
+mod jailed_cheats;
 
 #[cfg(not(feature = "jailed"))]
 mod targets {
