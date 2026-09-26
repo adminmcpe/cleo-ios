@@ -1,14 +1,15 @@
 //! Jailbreak-free access to GTA:SA's built-in cheat table.
 //!
-//! CLEO 2.6 already contains the correct cheat indices for this game build.
-//! We avoid hooking CCheat::DoCheats; actions are queued from the UIKit menu
-//! and executed after the overlay closes on the main thread.
+//! CLEO 2.6 already identified the game's 111 cheat slots for this iOS build.
+//! The jailed port calls the existing game functions directly; no executable-memory
+//! hook is required.
 
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
-const CHEAT_FUNCTION_TABLE: usize = 0x10065c358;
-const CHEAT_ACTIVE_FLAGS: usize = 0x10072dda8;
+pub(crate) const CHEAT_FUNCTION_TABLE: usize = 0x10065c358;
+pub(crate) const CHEAT_ACTIVE_FLAGS: usize = 0x10072dda8;
+pub(crate) const CHEAT_COUNT: usize = 111;
 
 extern "C" {
     fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
@@ -23,98 +24,124 @@ fn game_slide() -> usize {
     *SLIDE
 }
 
-fn absolute(address: usize) -> usize {
+pub(crate) fn absolute(address: usize) -> usize {
     address + game_slide()
 }
 
-static NAMED_CHEATS: &[(usize, &str)] = &[
-    (0, "THUGSARMOURY"),
-    (1, "PROFESSIONALSKIT"),
-    (2, "NUTTERSTOYS"),
-    (10, "INEEDSOMEHELP"),
-    (11, "TURNUPTHEHEAT"),
-    (12, "TURNDOWNTHEHEAT"),
-    (13, "PLEASANTLYWARM"),
-    (14, "TOODAMNHOT"),
-    (15, "DULLDULLDAY"),
-    (16, "STAYINANDWATCHTV"),
-    (17, "CANTSEEWHEREIMGOING"),
-    (18, "TIMEJUSTFLIESBY"),
-    (19, "SPEEDITUP"),
-    (20, "SLOWITDOWN"),
-    (21, "ROUGHNEIGHBOURHOOD"),
-    (22, "STOPPICKINGONME"),
-    (23, "SURROUNDEDBYNUTTERS"),
-    (24, "TIMETOKICKASS"),
-    (25, "OLDSPEEDDEMON"),
-    (27, "NOTFORPUBLICROADS"),
-    (28, "JUSTTRYANDSTOPME"),
-    (29, "WHERESTHEFUNERAL"),
-    (30, "CELEBRITYSTATUS"),
-    (31, "TRUEGRIME"),
-    (32, "18HOLES"),
-    (33, "ALLCARSGOBOOM"),
-    (34, "WHEELSONLYPLEASE"),
-    (35, "STICKLIKEGLUE"),
-    (36, "GOODBYECRUELWORLD"),
-    (37, "DONTTRYANDSTOPME"),
-    (38, "ALLDRIVERSARECRIMINALS"),
-    (39, "PINKISTHENEWCOOL"),
-    (40, "SOLONGASITSBLACK"),
-    (42, "FLYINGFISH"),
-    (43, "WHOATEALLTHEPIES"),
-    (44, "BUFFMEUP"),
-    (46, "LEANANDMEAN"),
-    (47, "BLUESUEDESHOES"),
-    (48, "ATTACKOFTHEVILLAGEPEOPLE"),
-    (49, "LIFESABEACH"),
-    (50, "ONLYHOMIESALLOWED"),
-    (51, "BETTERSTAYINDOORS"),
-    (52, "NINJATOWN"),
-    (53, "LOVECONQUERSALL"),
-    (54, "EVERYONEISPOOR"),
-    (55, "EVERYONEISRICH"),
-    (56, "CHITTYCHITTYBANGBANG"),
-    (57, "CJPHONEHOME"),
-    (58, "JUMPJET"),
-    (59, "IWANTTOHOVER"),
-    (60, "TOUCHMYCARYOUDIE"),
-    (61, "SPEEDFREAK"),
-    (62, "BUBBLECARS"),
-    (63, "NIGHTPROWLER"),
-    (64, "DONTBRINGONTHENIGHT"),
-    (65, "SCOTTISHSUMMER"),
-    (66, "SANDINMYEARS"),
-    (68, "KANGAROO"),
-    (69, "NOONECANHURTME"),
-    (70, "MANFROMATLANTIS"),
-    (71, "LETSGOBASEJUMPING"),
-    (72, "ROCKETMAN"),
-    (73, "IDOASIPLEASE"),
-    (74, "BRINGITON"),
-    (75, "STINGLIKEABEE"),
-    (76, "IAMNEVERHUNGRY"),
-    (77, "STATEOFEMERGENCY"),
-    (78, "CRAZYTOWN"),
-    (79, "TAKEACHILLPILL"),
-    (80, "FULLCLIP"),
-    (81, "IWANNADRIVEBY"),
-    (82, "GHOSTTOWN"),
-    (83, "HICKSVILLE"),
-    (84, "WANNABEINMYGANG"),
-    (85, "NOONECANSTOPUS"),
-    (86, "ROCKETMAYHEM"),
-    (87, "WORSHIPME"),
-    (88, "HELLOLADIES"),
-    (89, "ICANGOALLNIGHT"),
-    (90, "PROFESSIONALKILLER"),
-    (91, "NATURALTALENT"),
-    (92, "OHDUDE"),
-    (93, "FOURWHEELFUN"),
-    (94, "HITTHEROADJACK"),
-    (95, "ITSALLBULL"),
-    (96, "FLYINGTOSTUNT"),
-    (97, "MONSTERMASH"),
+// Every cheat slot is exposed. Entries without an official keyboard code are
+// given a descriptive internal name so they are still usable from the menu.
+static ALL_CHEATS: [&str; CHEAT_COUNT] = [
+    "THUGSARMOURY",
+    "PROFESSIONALSKIT",
+    "NUTTERSTOYS",
+    "[Weapons Set 4]",
+    "[Clock Forward]",
+    "[Skip Mission]",
+    "[Debug Mappings]",
+    "[Full Invincibility]",
+    "[Debug Tap To Target]",
+    "[Debug Targeting]",
+    "INEEDSOMEHELP",
+    "TURNUPTHEHEAT",
+    "TURNDOWNTHEHEAT",
+    "PLEASANTLYWARM",
+    "TOODAMNHOT",
+    "DULLDULLDAY",
+    "STAYINANDWATCHTV",
+    "CANTSEEWHEREIMGOING",
+    "TIMEJUSTFLIESBY",
+    "SPEEDITUP",
+    "SLOWITDOWN",
+    "ROUGHNEIGHBOURHOOD",
+    "STOPPICKINGONME",
+    "SURROUNDEDBYNUTTERS",
+    "TIMETOKICKASS",
+    "OLDSPEEDDEMON",
+    "[Tinted Rancher]",
+    "NOTFORPUBLICROADS",
+    "JUSTTRYANDSTOPME",
+    "WHERESTHEFUNERAL",
+    "CELEBRITYSTATUS",
+    "TRUEGRIME",
+    "18HOLES",
+    "ALLCARSGOBOOM",
+    "WHEELSONLYPLEASE",
+    "STICKLIKEGLUE",
+    "GOODBYECRUELWORLD",
+    "DONTTRYANDSTOPME",
+    "ALLDRIVERSARECRIMINALS",
+    "PINKISTHENEWCOOL",
+    "SOLONGASITSBLACK",
+    "[Sideways Wheels]",
+    "FLYINGFISH",
+    "WHOATEALLTHEPIES",
+    "BUFFMEUP",
+    "[Max Gambling]",
+    "LEANANDMEAN",
+    "BLUESUEDESHOES",
+    "ATTACKOFTHEVILLAGEPEOPLE",
+    "LIFESABEACH",
+    "ONLYHOMIESALLOWED",
+    "BETTERSTAYINDOORS",
+    "NINJATOWN",
+    "LOVECONQUERSALL",
+    "EVERYONEISPOOR",
+    "EVERYONEISRICH",
+    "CHITTYCHITTYBANGBANG",
+    "CJPHONEHOME",
+    "JUMPJET",
+    "IWANTTOHOVER",
+    "TOUCHMYCARYOUDIE",
+    "SPEEDFREAK",
+    "BUBBLECARS",
+    "NIGHTPROWLER",
+    "DONTBRINGONTHENIGHT",
+    "SCOTTISHSUMMER",
+    "SANDINMYEARS",
+    "[Predator]",
+    "KANGAROO",
+    "NOONECANHURTME",
+    "MANFROMATLANTIS",
+    "LETSGOBASEJUMPING",
+    "ROCKETMAN",
+    "IDOASIPLEASE",
+    "BRINGITON",
+    "STINGLIKEABEE",
+    "IAMNEVERHUNGRY",
+    "STATEOFEMERGENCY",
+    "CRAZYTOWN",
+    "TAKEACHILLPILL",
+    "FULLCLIP",
+    "IWANNADRIVEBY",
+    "GHOSTTOWN",
+    "HICKSVILLE",
+    "WANNABEINMYGANG",
+    "NOONECANSTOPUS",
+    "ROCKETMAYHEM",
+    "WORSHIPME",
+    "HELLOLADIES",
+    "ICANGOALLNIGHT",
+    "PROFESSIONALKILLER",
+    "NATURALTALENT",
+    "OHDUDE",
+    "FOURWHEELFUN",
+    "HITTHEROADJACK",
+    "ITSALLBULL",
+    "FLYINGTOSTUNT",
+    "MONSTERMASH",
+    "[Prostitutes Pay]",
+    "[Cool Taxis]",
+    "[Melee Slot]",
+    "[Handgun Slot]",
+    "[SMG Slot]",
+    "[Shotgun Slot]",
+    "[Assault Rifle Slot]",
+    "[Long Rifle Slot]",
+    "[Thrown Slot]",
+    "[Heavy Slot]",
+    "[Equipment Slot]",
+    "[Other Slot]",
+    "[Xbox Helper]",
 ];
 
 static QUEUED: Lazy<Mutex<Vec<usize>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -128,24 +155,38 @@ pub struct CheatStatus {
     pub will_be_active: bool,
 }
 
-fn active(index: usize) -> bool {
+pub(crate) fn active(index: usize) -> bool {
+    if index >= CHEAT_COUNT {
+        return false;
+    }
     unsafe { *(absolute(CHEAT_ACTIVE_FLAGS + index) as *const bool) }
 }
 
-fn set_active(index: usize, value: bool) {
+pub(crate) fn set_active(index: usize, value: bool) {
+    if index >= CHEAT_COUNT {
+        return;
+    }
     unsafe {
         *(absolute(CHEAT_ACTIVE_FLAGS + index) as *mut bool) = value;
     }
 }
 
-fn function_address(index: usize) -> usize {
+pub(crate) fn function_address(index: usize) -> usize {
+    if index >= CHEAT_COUNT {
+        return 0;
+    }
+
     unsafe {
         let slot = absolute(CHEAT_FUNCTION_TABLE + index * 8) as *const usize;
         slot.read()
     }
 }
 
-fn run(index: usize) {
+pub(crate) fn run_index(index: usize) {
+    if index >= CHEAT_COUNT {
+        return;
+    }
+
     let function = function_address(index);
 
     if function != 0 {
@@ -159,14 +200,15 @@ fn run(index: usize) {
 pub fn statuses() -> Vec<CheatStatus> {
     let queued = QUEUED.lock().unwrap();
 
-    let mut out: Vec<CheatStatus> = NAMED_CHEATS
+    let mut out: Vec<CheatStatus> = ALL_CHEATS
         .iter()
+        .enumerate()
         .map(|(index, code)| {
-            let is_active = active(*index);
-            let is_queued = queued.contains(index);
+            let is_active = active(index);
+            let is_queued = queued.contains(&index);
 
             CheatStatus {
-                table_index: *index,
+                table_index: index,
                 code,
                 active: is_active,
                 queued: is_queued,
@@ -211,7 +253,7 @@ pub fn process_queue() {
     };
 
     for index in pending {
-        run(index);
+        run_index(index);
     }
 }
 
