@@ -414,9 +414,9 @@ static INVINCIBILITY_COMPAT: Lazy<Mutex<Box<u8>>> =
     Lazy::new(|| Mutex::new(Box::new(0)));
 
 extern "C" fn jailed_toggle_player_invincibility() {
-    let current = crate::jailed_cheats::active(7);
     crate::jailed_cheats::run_index(7);
-    **INVINCIBILITY_COMPAT.lock().unwrap() = if !current { 1 } else { 0 };
+    let active = crate::jailed_cheats::active(7);
+    **INVINCIBILITY_COMPAT.lock().unwrap() = if active { 1 } else { 0 };
 }
 
 fn invincibility_value_ptr() -> usize {
