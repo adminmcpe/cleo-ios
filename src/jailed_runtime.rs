@@ -317,6 +317,45 @@ fn find_macho_symbol(name: &str) -> Option<usize> {
     None
 }
 
+fn is_executable_address(address: usize) -> bool {
+    unsafe {
+        let header = _dyld_get_image_header(0);
+        if header.is_null() {
+            return false;
+        }
+
+        let slide = _dyld_get_image_vmaddr_slide(0);
+        let mut command =
+            (header as *const u8).add(std::mem::size_of::<MachHeader64>());
+
+        for _ in 0..(*header).ncmds {
+            let load = &*(command as *const LoadCommand);
+            if load.cmdsize < std::mem::size_of::<LoadCommand>() as u32 {
+                return false;
+            }
+
+            if load.cmd == LC_SEGMENT_64
+                && load.cmdsize >= std::mem::size_of::<SegmentCommand64>() as u32
+            {
+                let segment = &*(command as *const SegmentCommand64);
+                let start = (segment.vmaddr as isize + slide) as usize;
+                let end = start.saturating_add(segment.vmsize as usize);
+
+                if address >= start
+                    && address < end
+                    && (segment.initprot & VM_PROT_EXECUTE) != 0
+                {
+                    return true;
+                }
+            }
+
+            command = command.add(load.cmdsize as usize);
+        }
+    }
+
+    false
+}
+
 fn find_native_game_symbol(name: &str) -> Option<usize> {
     let c_name = CString::new(name).ok()?;
     let ptr = unsafe {
@@ -352,6 +391,22 @@ static FXT_MAP: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(H
 static NEXT_FUNCTION_TOKEN: AtomicU32 = AtomicU32::new(0xC000_0000);
 static FUNCTION_TOKENS: Lazy<Mutex<HashMap<u32, usize>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static INVINCIBILITY_COMPAT: Lazy<Mutex<Box<u8>>> =
+    Lazy::new(|| Mutex::new(Box::new(0)));
+
+extern "C" fn jailed_toggle_player_invincibility() {
+    let current = crate::jailed_cheats::active(69);
+    crate::jailed_cheats::set_active(69, !current);
+    *INVINCIBILITY_COMPAT.lock().unwrap() = if !current { 1 } else { 0 };
+}
+
+fn invincibility_value_ptr() -> usize {
+    let active = crate::jailed_cheats::active(69);
+    let mut value = INVINCIBILITY_COMPAT.lock().unwrap();
+    *value = if active { 1 } else { 0 };
+    (&mut **value) as *mut u8 as usize
+}
+
 static PENDING_INVOKES: Lazy<Mutex<Vec<usize>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 const MOBILE_MENU_ANDROID_SIZE: usize = 0x4c;
@@ -887,12 +942,17 @@ impl Script {
     }
 
     fn resolve_callable(&self, address: u32) -> Option<usize> {
-        if let Some(real) = FUNCTION_TOKENS.lock().unwrap().get(&address).copied() {
-            return Some(real);
-        }
+        let real = if let Some(real) = FUNCTION_TOKENS.lock().unwrap().get(&address).copied() {
+            real
+        } else {
+            self.resolve_virtual_address(address, 1)?.0 as usize
+        };
 
-        self.resolve_virtual_address(address, 1)
-            .map(|(ptr, _)| ptr as usize)
+        // Never execute script bytes or writable/data mappings as code.
+        // Android 0DD2/0DDE scripts frequently manipulate pointers; treating an
+        // arbitrary virtual address as a callable function is an immediate crash
+        // on iOS. Only an address inside an executable Mach-O segment is callable.
+        is_executable_address(real).then_some(real)
     }
 
     fn call_integer_function(&mut self, address: u32, args: &[u64]) -> Option<u64> {
@@ -1047,6 +1107,12 @@ impl Script {
         // Synthetic 32-bit views for data whose iOS arm64 layout differs from
         // the Android layout expected by existing CSA/CSI bytecode.
         match name {
+            "_ZN10CPlayerPed22bDebugPlayerInvincibleE" => {
+                return Some((invincibility_value_ptr(), false, 1));
+            }
+            "_ZN6CCheat25TogglePlayerInvincibilityEv" => {
+                return Some((jailed_toggle_player_invincibility as usize, false, 1));
+            }
             "_ZN6CCheat17m_aCheatFunctionsE" => {
                 return Some((
                     CHEAT_FUNCTION_COMPAT.as_ptr() as usize,
