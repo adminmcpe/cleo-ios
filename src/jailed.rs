@@ -361,7 +361,7 @@ fn add_cheat_rows(parent: *mut Object, width: f64) {
         .unwrap_or(0) as *mut Object;
 
     let row_count = cheats.len();
-    let mut y = 78.0;
+    let mut y = 0.0;
 
     for (index, cheat) in cheats.into_iter().enumerate() {
         let value = if cheat.queued {
