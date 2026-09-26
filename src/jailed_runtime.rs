@@ -1043,6 +1043,35 @@ impl Script {
 
     fn update_android_opcode(&mut self, opcode: u16) -> Option<bool> {
         match opcode {
+            // CLEO Android: store_target_marker_coords_to X Y Z // IF and SET
+            //
+            // This must be intercepted here. 0AB6 is a CLEO extension, not a
+            // native GTA SCM opcode; forwarding it to GTA's generic mobile
+            // handler can execute unrelated code.
+            0x0ab6 => {
+                let out_x = self.read_variable_arg::<*mut u32>();
+                let out_y = self.read_variable_arg::<*mut u32>();
+                let out_z = self.read_variable_arg::<*mut u32>();
+
+                if let Some((x, y, z)) = target_blip_coords_from_game() {
+                    unsafe {
+                        out_x.write(x.to_bits());
+                        out_y.write(y.to_bits());
+                        out_z.write(z.to_bits());
+                    }
+                    self.update_bool_flag(true);
+                } else {
+                    unsafe {
+                        out_x.write(0);
+                        out_y.write(0);
+                        out_z.write(0);
+                    }
+                    self.update_bool_flag(false);
+                }
+
+                Some(false)
+            }
+
             // get_label_addr
             0x0dd0 => {
                 let destination = self.read_variable_arg::<*mut u32>();
