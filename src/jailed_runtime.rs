@@ -32,8 +32,45 @@ const SCRIPT_VIRTUAL_STRIDE: u32 = 0x0010_0000;
 const SYMBOL_VIRTUAL_STRIDE: u32 = 0x0010_0000;
 const SYMBOL_VIRTUAL_SPAN: u32 = 0x0010_0000;
 
+const LC_SEGMENT_64: u32 = 0x19;
+const VM_PROT_EXECUTE: i32 = 0x4;
+
+#[repr(C)]
+struct MachHeader64 {
+    magic: u32,
+    cpu_type: i32,
+    cpu_subtype: i32,
+    file_type: u32,
+    ncmds: u32,
+    sizeofcmds: u32,
+    flags: u32,
+    reserved: u32,
+}
+
+#[repr(C)]
+struct LoadCommand {
+    cmd: u32,
+    cmdsize: u32,
+}
+
+#[repr(C)]
+struct SegmentCommand64 {
+    cmd: u32,
+    cmdsize: u32,
+    segname: [u8; 16],
+    vmaddr: u64,
+    vmsize: u64,
+    fileoff: u64,
+    filesize: u64,
+    maxprot: i32,
+    initprot: i32,
+    nsects: u32,
+    flags: u32,
+}
+
 extern "C" {
     fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
+    fn _dyld_get_image_header(image_index: u32) -> *const MachHeader64;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
@@ -63,6 +100,79 @@ fn android_str_hash(value: &str) -> u32 {
     hash = hash.wrapping_add(hash << 3);
     hash ^= hash >> 11;
     hash.wrapping_add(hash << 15)
+}
+
+fn parse_pattern(pattern: &str) -> Option<Vec<Option<u8>>> {
+    let mut out = Vec::new();
+
+    for part in pattern.split_whitespace() {
+        if part == "?" || part == "??" {
+            out.push(None);
+            continue;
+        }
+
+        if part.len() != 2 {
+            return None;
+        }
+
+        let value = u8::from_str_radix(part, 16).ok()?;
+        out.push(Some(value));
+    }
+
+    (!out.is_empty()).then_some(out)
+}
+
+fn find_ios_pattern(pattern: &str, mut wanted_index: usize) -> Option<usize> {
+    let pattern = parse_pattern(pattern)?;
+
+    unsafe {
+        let header = _dyld_get_image_header(0);
+        if header.is_null() {
+            return None;
+        }
+
+        let slide = _dyld_get_image_vmaddr_slide(0);
+        let mut command = (header as *const u8).add(std::mem::size_of::<MachHeader64>());
+
+        for _ in 0..(*header).ncmds {
+            let load = &*(command as *const LoadCommand);
+            if load.cmdsize < std::mem::size_of::<LoadCommand>() as u32 {
+                return None;
+            }
+
+            if load.cmd == LC_SEGMENT_64
+                && load.cmdsize >= std::mem::size_of::<SegmentCommand64>() as u32
+            {
+                let segment = &*(command as *const SegmentCommand64);
+
+                if segment.initprot & VM_PROT_EXECUTE != 0
+                    && segment.vmsize >= pattern.len() as u64
+                    && segment.vmsize <= 128 * 1024 * 1024
+                {
+                    let start = (segment.vmaddr as isize + slide) as *const u8;
+                    let size = segment.vmsize as usize;
+                    let bytes = std::slice::from_raw_parts(start, size);
+
+                    for offset in 0..=size - pattern.len() {
+                        let matches = pattern.iter().enumerate().all(|(i, expected)| {
+                            expected.map(|b| bytes[offset + i] == b).unwrap_or(true)
+                        });
+
+                        if matches {
+                            if wanted_index == 0 {
+                                return Some(start.add(offset) as usize);
+                            }
+                            wanted_index -= 1;
+                        }
+                    }
+                }
+            }
+
+            command = command.add(load.cmdsize as usize);
+        }
+    }
+
+    None
 }
 
 unsafe fn read_global<T: Copy>(address: usize) -> T {
@@ -1076,6 +1186,69 @@ fn cleo_dir() -> PathBuf {
     path
 }
 
+fn collect_fxt_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            collect_fxt_files(&path, out);
+            continue;
+        }
+
+        if path
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case("fxt"))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn reload_fxt(root: &Path) {
+    let mut files = Vec::new();
+    collect_fxt_files(root, &mut files);
+    files.sort_by_key(|p| p.display().to_string().to_lowercase());
+
+    let mut map = HashMap::new();
+
+    for path in files {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let split_at = line
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(i, _)| i);
+
+            let Some(split_at) = split_at else {
+                continue;
+            };
+
+            let key = line[..split_at].trim();
+            let value = line[split_at..].trim();
+
+            if !key.is_empty() && !value.is_empty() {
+                map.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+
+    *FXT_MAP.lock().unwrap() = map;
+}
+
 fn collect_scripts(dir: &Path, out: &mut Vec<(Kind, PathBuf)>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -1105,6 +1278,8 @@ pub fn reload_scripts() {
     let root = cleo_dir();
     let _ = fs::create_dir_all(&root);
 
+    reload_fxt(&root);
+
     let mut paths = Vec::new();
     collect_scripts(&root, &mut paths);
     paths.sort_by_key(|(_, p)| p.display().to_string().to_lowercase());
@@ -1129,6 +1304,10 @@ pub fn reload_scripts() {
         scripts.push(Script::new(kind, bytes, name));
     }
 
+    CSI_COUNT.store(
+        scripts.iter().filter(|script| script.kind == Kind::Csi).count() as u32,
+        Ordering::SeqCst,
+    );
     *SCRIPTS.lock().unwrap() = scripts;
 }
 
@@ -1148,6 +1327,8 @@ fn end_game_session() {
     for script in scripts.iter_mut() {
         script.game.active = false;
     }
+    crate::jailed::hide_android_menu();
+    crate::jailed_touch::reset();
 }
 
 pub fn tick() {
@@ -1177,6 +1358,23 @@ pub fn tick() {
         }
 
         script.update();
+    }
+
+    let pending = {
+        let mut queue = PENDING_INVOKES.lock().unwrap();
+        std::mem::take(&mut *queue)
+    };
+
+    for id in pending {
+        if let Some(script) = scripts
+            .iter_mut()
+            .filter(|script| script.kind == Kind::Csi)
+            .nth(id)
+        {
+            if !script.game.active {
+                script.reset(true);
+            }
+        }
     }
 }
 
