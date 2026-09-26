@@ -644,17 +644,24 @@ fn install_swipe_gesture() {
         let _: () = msg_send![window, addGestureRecognizer: recognizer];
         let _: () = msg_send![recognizer, release];
 
-        let touch: *mut Object = msg_send![class!(UILongPressGestureRecognizer), alloc];
-        let touch: *mut Object =
-            msg_send![touch, initWithTarget: target action: sel!(handleCleoTouch:)];
-        let _: () = msg_send![touch, setMinimumPressDuration: 0.0f64];
-        let _: () = msg_send![touch, setAllowableMovement: 10000.0f64];
-        let _: () = msg_send![touch, setMinimumNumberOfTouches: 1usize];
-        let _: () = msg_send![touch, setMaximumNumberOfTouches: 2usize];
-        let _: () = msg_send![touch, setCancelsTouchesInView: false];
-        let _: () = msg_send![touch, setDelegate: target];
-        let _: () = msg_send![window, addGestureRecognizer: touch];
-        let _: () = msg_send![touch, release];
+        // UILongPressGestureRecognizer does NOT implement
+        // setMinimumNumberOfTouches:/setMaximumNumberOfTouches:. Calling those
+        // selectors aborts during LegalSplash viewDidLoad on iOS. Use two
+        // recognizers with the valid numberOfTouchesRequired property instead:
+        // one for normal one-finger CLEO input and one for Android-style
+        // two-finger combinations.
+        for required_touches in [1usize, 2usize] {
+            let touch: *mut Object = msg_send![class!(UILongPressGestureRecognizer), alloc];
+            let touch: *mut Object =
+                msg_send![touch, initWithTarget: target action: sel!(handleCleoTouch:)];
+            let _: () = msg_send![touch, setMinimumPressDuration: 0.0f64];
+            let _: () = msg_send![touch, setAllowableMovement: 10000.0f64];
+            let _: () = msg_send![touch, setNumberOfTouchesRequired: required_touches];
+            let _: () = msg_send![touch, setCancelsTouchesInView: false];
+            let _: () = msg_send![touch, setDelegate: target];
+            let _: () = msg_send![window, addGestureRecognizer: touch];
+            let _: () = msg_send![touch, release];
+        }
 
         let _ = GESTURE_TARGET.set(target as usize);
     }
