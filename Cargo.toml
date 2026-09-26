@@ -8,10 +8,11 @@ publish = false
 
 [lib]
 name = "cleo"
-crate-type = ["staticlib"]
+crate-type = ["cdylib"]
 
 [features]
 debug = []
+jailed = []
 
 [patch.crates-io]
 # The fork fixes a bug that prevents building for iOS.
