@@ -6,10 +6,12 @@
 
 use once_cell::sync::Lazy;
 use std::{
+    collections::HashMap,
+    ffi::{c_char, c_void, CStr, CString},
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Mutex,
     },
 };
@@ -18,11 +20,18 @@ const GAME_STATE_ADDR: usize = 0x1006806d0;
 const GAME_TIME_ADDR: usize = 0x1007d3af8;
 const COMMAND_TABLE_ADDR: usize = 0x1005c11d8;
 const EXTENDED_HANDLER_ADDR: usize = 0x10020980c;
+const COLLECT_PARAMETERS_ADDR: usize = 0x1001cf474;
+const GET_POINTER_TO_VARIABLE_ADDR: usize = 0x1001cfb04;
+const SCRIPT_PARAMS_ADDR: usize = 0x1007ad690;
 
 const MAX_INSTRUCTIONS_PER_TICK: usize = 512;
+const SCRIPT_VIRTUAL_STRIDE: u32 = 0x0010_0000;
+const SYMBOL_VIRTUAL_STRIDE: u32 = 0x0010_0000;
+const SYMBOL_VIRTUAL_SPAN: u32 = 0x0010_0000;
 
 extern "C" {
     fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
 fn game_slide() -> usize {
@@ -43,6 +52,38 @@ fn absolute(address: usize) -> usize {
 
 unsafe fn read_global<T: Copy>(address: usize) -> T {
     (absolute(address) as *const T).read()
+}
+
+#[derive(Debug, Clone)]
+struct AddressRegion {
+    virtual_base: u32,
+    real_base: usize,
+    span: u32,
+    writable: bool,
+    name: String,
+}
+
+static NEXT_SCRIPT_VBASE: AtomicU32 = AtomicU32::new(0xE000_0000);
+static NEXT_SYMBOL_VBASE: AtomicU32 = AtomicU32::new(0xD000_0000);
+static SYMBOL_REGIONS: Lazy<Mutex<Vec<AddressRegion>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static MUTEX_VARS: Lazy<Mutex<HashMap<u32, u32>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn register_symbol_region(name: &str, real_base: usize, writable: bool) -> u32 {
+    let mut regions = SYMBOL_REGIONS.lock().unwrap();
+
+    if let Some(existing) = regions.iter().find(|region| region.name == name) {
+        return existing.virtual_base;
+    }
+
+    let virtual_base = NEXT_SYMBOL_VBASE.fetch_add(SYMBOL_VIRTUAL_STRIDE, Ordering::SeqCst);
+    regions.push(AddressRegion {
+        virtual_base,
+        real_base,
+        span: SYMBOL_VIRTUAL_SPAN,
+        writable,
+        name: name.to_string(),
+    });
+    virtual_base
 }
 
 #[repr(C, align(8))]
@@ -115,6 +156,7 @@ struct Script {
     name: String,
     enabled: bool,
     error: Option<String>,
+    virtual_base: u32,
 }
 
 unsafe impl Send for Script {}
@@ -130,6 +172,7 @@ impl Script {
             name,
             enabled: kind == Kind::Csa,
             error: None,
+            virtual_base: NEXT_SCRIPT_VBASE.fetch_add(SCRIPT_VIRTUAL_STRIDE, Ordering::SeqCst),
         }
     }
 
@@ -142,6 +185,279 @@ impl Script {
     fn stop_with_error(&mut self, message: String) {
         self.game.active = false;
         self.error = Some(message);
+    }
+
+    fn collect_value_args(&mut self, count: u32) {
+        type Collect = fn(*mut GameScript, u32);
+        let collect: Collect = unsafe { std::mem::transmute(absolute(COLLECT_PARAMETERS_ADDR)) };
+        collect(&mut self.game, count);
+    }
+
+    fn read_variable_arg<T: Copy>(&mut self) -> T {
+        let get_ptr: fn(*mut GameScript) -> T =
+            unsafe { std::mem::transmute(absolute(GET_POINTER_TO_VARIABLE_ADDR)) };
+        get_ptr(&mut self.game)
+    }
+
+    fn script_params() -> *const u32 {
+        absolute(SCRIPT_PARAMS_ADDR) as *const u32
+    }
+
+    fn resolve_virtual_address(&self, address: u32, size: usize) -> Option<(*mut u8, bool)> {
+        let script_len = self.bytes.len().min(SCRIPT_VIRTUAL_STRIDE as usize) as u32;
+        let script_end = self.virtual_base.saturating_add(script_len);
+
+        if address >= self.virtual_base
+            && address.saturating_add(size as u32) <= script_end
+        {
+            let offset = (address - self.virtual_base) as usize;
+            let real = unsafe { self.bytes.as_ptr().add(offset) as *mut u8 };
+            return Some((real, true));
+        }
+
+        let regions = SYMBOL_REGIONS.lock().unwrap();
+        for region in regions.iter() {
+            let end = region.virtual_base.saturating_add(region.span);
+            if address >= region.virtual_base
+                && address.saturating_add(size as u32) <= end
+            {
+                let offset = (address - region.virtual_base) as usize;
+                let real = (region.real_base + offset) as *mut u8;
+                return Some((real, region.writable));
+            }
+        }
+
+        None
+    }
+
+    fn read_virtual_c_string(&self, address: u32) -> Option<String> {
+        // Symbol names used by CLEO Android are short. Cap the scan so a corrupt
+        // script can never walk arbitrary memory indefinitely.
+        let mut out = Vec::new();
+
+        for offset in 0..256u32 {
+            let (ptr, _) = self.resolve_virtual_address(address.wrapping_add(offset), 1)?;
+            let byte = unsafe { ptr.read() };
+            if byte == 0 {
+                return String::from_utf8(out).ok();
+            }
+            out.push(byte);
+        }
+
+        None
+    }
+
+    fn android_symbol(&self, name: &str) -> Option<(usize, bool)> {
+        // First try normal dynamic lookup. A few C/runtime symbols are exported on
+        // iOS even though most GTA C++ symbols are stripped.
+        let c_name = CString::new(name).ok()?;
+        let ptr = unsafe {
+            // Darwin RTLD_DEFAULT is ((void *)-2).
+            dlsym((-2isize) as *mut c_void, c_name.as_ptr())
+        };
+
+        if !ptr.is_null() {
+            // Treat arbitrary dynamically found symbols as read-only until we have
+            // verified that a script is addressing writable game data.
+            return Some((ptr as usize, false));
+        }
+
+        // GTA-specific stripped-symbol translations are added here as we verify
+        // their iOS 2.02.11 addresses/patterns.
+        None
+    }
+
+    fn update_android_opcode(&mut self, opcode: u16) -> Option<bool> {
+        match opcode {
+            // get_label_addr
+            0x0dd0 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(1);
+
+                let raw = unsafe { Self::script_params().read() };
+                let signed = raw as i32;
+                let offset = if signed >= 0 {
+                    signed as u32
+                } else {
+                    signed.unsigned_abs()
+                };
+
+                if offset as usize >= self.bytes.len() {
+                    self.stop_with_error(format!(
+                        "Android label offset {offset:#x} is outside script"
+                    ));
+                    return Some(true);
+                }
+
+                unsafe {
+                    destination.write(self.virtual_base.wrapping_add(offset));
+                }
+                Some(false)
+            }
+
+            // get_func_addr_by_cstr_name
+            0x0dd1 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(1);
+                let string_address = unsafe { Self::script_params().read() };
+
+                let Some(name) = self.read_virtual_c_string(string_address) else {
+                    self.stop_with_error("Android 0DD1 received an invalid symbol string".to_string());
+                    return Some(true);
+                };
+
+                let Some((real, writable)) = self.android_symbol(&name) else {
+                    self.stop_with_error(format!("Android symbol not found on iOS: {name}"));
+                    return Some(true);
+                };
+
+                let token = register_symbol_region(&name, real, writable);
+                unsafe {
+                    destination.write(token);
+                }
+                Some(false)
+            }
+
+            // get_platform. Return Android intentionally: compatibility scripts
+            // should follow their Android branch rather than an unknown-platform path.
+            0x0dd5 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                unsafe {
+                    destination.write(1);
+                }
+                Some(false)
+            }
+
+            // get_game_version. CLEO Android uses 17 for GTASA 2.00-or-higher.
+            0x0dd6 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                unsafe {
+                    destination.write(17);
+                }
+                Some(false)
+            }
+
+            // read_mem_addr
+            0x0dd8 => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(3);
+                let params = Self::script_params();
+                let address = unsafe { params.read() };
+                let size = unsafe { params.add(1).read() } as usize;
+                let add_image_base = unsafe { params.add(2).read() } != 0;
+
+                if !(1..=4).contains(&size) {
+                    self.stop_with_error(format!("Android 0DD8 invalid read size {size}"));
+                    return Some(true);
+                }
+
+                if add_image_base {
+                    self.stop_with_error(
+                        "Android 0DD8 add_ib=1 needs an iOS address translation".to_string(),
+                    );
+                    return Some(true);
+                }
+
+                let Some((source, _)) = self.resolve_virtual_address(address, size) else {
+                    self.stop_with_error(format!(
+                        "Android 0DD8 address {address:#010x} is not translated"
+                    ));
+                    return Some(true);
+                };
+
+                let mut value = 0u32;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source as *const u8,
+                        (&mut value as *mut u32).cast::<u8>(),
+                        size,
+                    );
+                    destination.write(value);
+                }
+                Some(false)
+            }
+
+            // write_mem_addr. Script-local data is writable now; writes into GTA
+            // symbols stay blocked until their segment protection is verified.
+            0x0dd9 => {
+                self.collect_value_args(5);
+                let params = Self::script_params();
+                let address = unsafe { params.read() };
+                let value = unsafe { params.add(1).read() };
+                let size = unsafe { params.add(2).read() } as usize;
+                let add_image_base = unsafe { params.add(3).read() } != 0;
+
+                if !(1..=4).contains(&size) {
+                    self.stop_with_error(format!("Android 0DD9 invalid write size {size}"));
+                    return Some(true);
+                }
+
+                if add_image_base {
+                    self.stop_with_error(
+                        "Android 0DD9 add_ib=1 needs an iOS address translation".to_string(),
+                    );
+                    return Some(true);
+                }
+
+                let Some((destination, writable)) = self.resolve_virtual_address(address, size) else {
+                    self.stop_with_error(format!(
+                        "Android 0DD9 address {address:#010x} is not translated"
+                    ));
+                    return Some(true);
+                };
+
+                if !writable {
+                    self.stop_with_error(
+                        "Android 0DD9 tried to write an unverified iOS symbol".to_string(),
+                    );
+                    return Some(true);
+                }
+
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (&value as *const u32).cast::<u8>(),
+                        destination,
+                        size,
+                    );
+                }
+                Some(false)
+            }
+
+            // set_mutex_var
+            0x0ddc => {
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                let id = unsafe { params.read() };
+                let value = unsafe { params.add(1).read() };
+                MUTEX_VARS.lock().unwrap().insert(id, value);
+                Some(false)
+            }
+
+            // get_mutex_var
+            0x0ddd => {
+                let destination = self.read_variable_arg::<*mut u32>();
+                self.collect_value_args(1);
+                let id = unsafe { Self::script_params().read() };
+                let value = *MUTEX_VARS.lock().unwrap().get(&id).unwrap_or(&0);
+                unsafe {
+                    destination.write(value);
+                }
+                Some(false)
+            }
+
+            // Known Android CLEO opcodes not ported yet. Keep the error explicit so
+            // each script tells us exactly what compatibility work remains.
+            0x0dd2..=0x0dd4
+            | 0x0dd7
+            | 0x0dda..=0x0ddb
+            | 0x0dde
+            | 0x0de0..=0x0df6 => {
+                self.stop_with_error(format!("Android CLEO opcode {opcode:#06x} not ported yet"));
+                Some(true)
+            }
+
+            _ => None,
+        }
     }
 
     fn update_one(&mut self) -> bool {
@@ -166,15 +482,13 @@ impl Script {
             return true;
         }
 
-        // These are Android-specific / unimplemented CLEO opcodes in the original
-        // iOS checker. Stop cleanly instead of letting the game execute them.
-        if matches!(
-            opcode,
-            0x00e1
-                | 0x0dd0..=0x0dde
-                | 0x0de0..=0x0df6
-        ) {
-            self.stop_with_error(format!("Unsupported iOS opcode {opcode:#06x}"));
+        if let Some(can_interrupt) = self.update_android_opcode(opcode) {
+            return can_interrupt;
+        }
+
+        // The game's touch-zone opcode needs its own jailed UIKit translation.
+        if opcode == 0x00e1 {
+            self.stop_with_error("iOS touch-zone opcode 0x00e1 not ported yet".to_string());
             return true;
         }
 
