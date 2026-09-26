@@ -11,7 +11,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Mutex,
     },
 };
@@ -312,14 +312,10 @@ static FUNCTION_TOKENS: Lazy<Mutex<HashMap<u32, usize>>> =
 static PENDING_INVOKES: Lazy<Mutex<Vec<usize>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 const MOBILE_MENU_ANDROID_SIZE: usize = 0x4c;
-const MOBILE_MENU_IOS_TARGET_BLIP_OFFSET: usize = 0x68;
 const MOBILE_MENU_ANDROID_TARGET_BLIP_OFFSET: usize = 0x48;
 const RADAR_TRACE_COUNT: usize = 175;
 const RADAR_TRACE_ANDROID_STRIDE: usize = 0x28;
-const RADAR_TRACE_IOS_STRIDE: usize = 0x30;
 
-static MOBILE_MENU_REAL: AtomicUsize = AtomicUsize::new(0);
-static RADAR_TRACE_REAL: AtomicUsize = AtomicUsize::new(0);
 static MOBILE_MENU_COMPAT: Lazy<Mutex<Box<[u8]>>> =
     Lazy::new(|| Mutex::new(vec![0u8; MOBILE_MENU_ANDROID_SIZE].into_boxed_slice()));
 static RADAR_TRACE_COMPAT: Lazy<Mutex<Box<[u8]>>> = Lazy::new(|| {
@@ -328,59 +324,63 @@ static RADAR_TRACE_COMPAT: Lazy<Mutex<Box<[u8]>>> = Lazy::new(|| {
     )
 });
 
-fn refresh_mobile_menu_compat() {
-    let real = MOBILE_MENU_REAL.load(Ordering::SeqCst);
-    if real == 0 {
-        return;
-    }
+fn target_blip_coords_from_game() -> Option<(f32, f32, f32)> {
+    // CLEO/mobile command 0AB6 GET_TARGET_BLIP_COORDINATES is already handled
+    // by GTA's own extended opcode handler on this iOS build. Run it against a
+    // tiny scratch script and use local variables 0@, 1@ and 2@ as outputs.
+    let params: [u8; 9] = [
+        0x03, 0x00, 0x00, // 0@
+        0x03, 0x04, 0x00, // 1@
+        0x03, 0x08, 0x00, // 2@
+    ];
 
-    let mut compat = MOBILE_MENU_COMPAT.lock().unwrap();
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            (real + MOBILE_MENU_IOS_TARGET_BLIP_OFFSET) as *const u8,
-            compat
-                .as_mut_ptr()
-                .add(MOBILE_MENU_ANDROID_TARGET_BLIP_OFFSET),
-            4,
-        );
+    let mut script = GameScript::new(params.as_ptr().cast::<u16>(), true);
+    type Handler = fn(*mut GameScript, u16) -> u8;
+    let handler: Handler = unsafe { std::mem::transmute(absolute(EXTENDED_HANDLER_ADDR)) };
+    let _ = handler(&mut script, 0x0ab6);
+
+    let x = f32::from_bits(script.locals[0]);
+    let y = f32::from_bits(script.locals[1]);
+    let z = f32::from_bits(script.locals[2]);
+
+    if x.is_finite() && y.is_finite() && z.is_finite() {
+        Some((x, y, z))
+    } else {
+        None
     }
 }
 
-fn refresh_radar_trace_compat() {
-    let real = RADAR_TRACE_REAL.load(Ordering::SeqCst);
-    if real == 0 {
+fn refresh_marker_compat() {
+    let mut mobile = MOBILE_MENU_COMPAT.lock().unwrap();
+    let mut radar = RADAR_TRACE_COMPAT.lock().unwrap();
+
+    mobile.fill(0);
+    radar.fill(0);
+
+    let Some((x, y, z)) = target_blip_coords_from_game() else {
         return;
-    }
+    };
 
-    let mut compat = RADAR_TRACE_COMPAT.lock().unwrap();
+    // Existing Android teleport scripts read only the low 16-bit radar-array
+    // index from gMobileMenu+0x48. Give them a synthetic record at index 1.
+    let synthetic_index: u16 = 1;
+    mobile[MOBILE_MENU_ANDROID_TARGET_BLIP_OFFSET
+        ..MOBILE_MENU_ANDROID_TARGET_BLIP_OFFSET + 2]
+        .copy_from_slice(&synthetic_index.to_le_bytes());
 
-    for index in 0..RADAR_TRACE_COUNT {
-        let source = (real + index * RADAR_TRACE_IOS_STRIDE) as *const u8;
-        let destination = unsafe {
-            compat
-                .as_mut_ptr()
-                .add(index * RADAR_TRACE_ANDROID_STRIDE)
-        };
+    let base = synthetic_index as usize * RADAR_TRACE_ANDROID_STRIDE;
 
-        unsafe {
-            // Through m_nBlipSize the 32-bit and arm64 layouts are identical.
-            std::ptr::copy_nonoverlapping(source, destination, 0x20);
-
-            // Android has a 4-byte CEntryExit* at 0x20. Scripts generally only
-            // care about position/sprite data, so don't expose a truncated iOS pointer.
-            std::ptr::write_bytes(destination.add(0x20), 0, 4);
-
-            // On arm64 the 8-byte pointer shifts m_nRadarSprite and flag bytes
-            // from 0x24 to 0x28. Repack those bytes into Android's 0x28 layout.
-            std::ptr::copy_nonoverlapping(source.add(0x28), destination.add(0x24), 4);
-        }
-    }
+    // Android tRadarTrace: CVector position begins at +0x08 and the sprite id is
+    // at +0x24. Icon 41 is the map waypoint used by the classic teleport script.
+    radar[base + 0x08..base + 0x0c].copy_from_slice(&x.to_bits().to_le_bytes());
+    radar[base + 0x0c..base + 0x10].copy_from_slice(&y.to_bits().to_le_bytes());
+    radar[base + 0x10..base + 0x14].copy_from_slice(&z.to_bits().to_le_bytes());
+    radar[base + 0x24] = 41;
 }
 
 fn refresh_android_adapter(name: &str) {
     match name {
-        "gMobileMenu" => refresh_mobile_menu_compat(),
-        "_ZN6CRadar13ms_RadarTraceE" => refresh_radar_trace_compat(),
+        "gMobileMenu" | "_ZN6CRadar13ms_RadarTraceE" => refresh_marker_compat(),
         _ => {}
     }
 }
@@ -722,9 +722,7 @@ impl Script {
                 ));
             }
             "gMobileMenu" => {
-                let real = find_native_game_symbol(name)?;
-                MOBILE_MENU_REAL.store(real, Ordering::SeqCst);
-                refresh_mobile_menu_compat();
+                refresh_marker_compat();
                 let compat = MOBILE_MENU_COMPAT.lock().unwrap();
                 return Some((
                     compat.as_ptr() as usize,
@@ -733,9 +731,7 @@ impl Script {
                 ));
             }
             "_ZN6CRadar13ms_RadarTraceE" => {
-                let real = find_native_game_symbol(name)?;
-                RADAR_TRACE_REAL.store(real, Ordering::SeqCst);
-                refresh_radar_trace_compat();
+                refresh_marker_compat();
                 let compat = RADAR_TRACE_COMPAT.lock().unwrap();
                 return Some((
                     compat.as_ptr() as usize,
