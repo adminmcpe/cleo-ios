@@ -554,7 +554,12 @@ fn scan_waypoint_from_game_data() -> Option<(f32, f32, f32)> {
         }
     }
 
-    best.map(|(_, x, y, z)| (x, y, z))
+    // Require evidence that the candidate belongs to a contiguous radar array.
+    // A single accidental byte value 41 must never be enough to move the player.
+    match best {
+        Some((score, x, y, z)) if score >= 36 => Some((x, y, z)),
+        _ => None,
+    }
 }
 
 fn target_blip_coords_from_game() -> Option<(f32, f32, f32)> {
