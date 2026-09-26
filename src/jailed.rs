@@ -68,6 +68,7 @@ static SELECTED_TAB: AtomicUsize = AtomicUsize::new(TAG_TAB_CSI as usize);
 static TIMER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static ANDROID_MENU_OVERLAY: AtomicUsize = AtomicUsize::new(0);
 static SCRIPT_TEXT_OVERLAY: AtomicUsize = AtomicUsize::new(0);
+static SCRIPT_TEXT_COMMITTED_THIS_TICK: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScriptTextDraw {
@@ -166,6 +167,16 @@ fn clear_view_subviews(view: *mut Object) {
     }
 }
 
+pub fn begin_script_text_tick() {
+    SCRIPT_TEXT_COMMITTED_THIS_TICK.store(false, Ordering::SeqCst);
+}
+
+pub fn end_script_text_tick() {
+    if !SCRIPT_TEXT_COMMITTED_THIS_TICK.load(Ordering::SeqCst) {
+        hide_script_text_overlay();
+    }
+}
+
 pub fn hide_script_text_overlay() {
     LAST_SCRIPT_TEXT_FRAME.lock().unwrap().clear();
 
@@ -182,6 +193,8 @@ pub fn hide_script_text_overlay() {
 }
 
 pub fn render_script_text_frame(frame: Vec<ScriptTextDraw>) {
+    SCRIPT_TEXT_COMMITTED_THIS_TICK.store(true, Ordering::SeqCst);
+
     // The normal CLEO menu should always stay above script-owned HUD/menu text.
     if OVERLAY.load(Ordering::SeqCst) != 0 || ANDROID_MENU_OVERLAY.load(Ordering::SeqCst) != 0 {
         return;
