@@ -1144,7 +1144,7 @@ impl Script {
         FXT_MAP
             .lock()
             .unwrap()
-            .get(key)
+            .get(&key.to_ascii_uppercase())
             .cloned()
             .unwrap_or_else(|| key.to_string())
     }
@@ -1831,8 +1831,9 @@ impl Script {
         self.game.not_flag = op_as_written & 0x8000 != 0;
         let opcode = op_as_written & 0x7fff;
 
-        // CLEO intercepts terminate so the game does not free memory owned by Rust.
-        if opcode == 0x004e {
+        // CLEO Android replaces both ENDTHREAD (004E) and ENDCUSTOMTHREAD
+        // (05DC). Never let GTA free memory owned by our Rust script object.
+        if opcode == 0x004e || opcode == 0x05dc {
             self.reset(false);
             return true;
         }
@@ -1852,11 +1853,13 @@ impl Script {
             return true;
         }
 
-        // iOS CLEO touch-zone opcode. The second parameter is the CLEO zone.
+        // CLEO Android overloads KEY/NOT_KEY (00E1/80E1) for touch zones.
+        // Its point_touched() remains true for 150 ms after any touch event, so
+        // simultaneous combinations such as zones 2+4 work reliably.
         if opcode == 0x00e1 {
             self.collect_value_args(2);
             let zone = unsafe { Self::script_params().add(1).read() };
-            self.update_bool_flag(crate::jailed_touch::zone_pressed(zone));
+            self.update_bool_flag(crate::jailed_touch::point_touched_recent(zone));
             return true;
         }
 
@@ -2001,9 +2004,10 @@ fn reload_fxt(root: &Path) {
     let mut map = HashMap::new();
 
     for path in files {
-        let Ok(text) = fs::read_to_string(path) else {
+        let Ok(bytes) = fs::read(path) else {
             continue;
         };
+        let text = String::from_utf8_lossy(&bytes);
 
         for raw_line in text.lines() {
             let line = raw_line.trim();
@@ -2024,7 +2028,9 @@ fn reload_fxt(root: &Path) {
             let value = line[split_at..].trim();
 
             if !key.is_empty() && !value.is_empty() {
-                map.insert(key.to_string(), value.to_string());
+                // GXT keys are ASCII identifiers and game scripts do not
+                // consistently preserve case across mobile mods.
+                map.insert(key.to_ascii_uppercase(), value.to_string());
             }
         }
     }
