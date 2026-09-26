@@ -153,6 +153,11 @@ fn install_panic_hook() {
 }
 
 pub fn init() {
+    // The original project notes that macOS-built dylibs can crash around the
+    // custom panic hook. Keep it for normal tweak builds, but omit it from the
+    // jailed proof-of-concept so a sideloaded build has the smallest possible
+    // runtime surface.
+    #[cfg(not(feature = "jailed"))]
     install_panic_hook();
 
     log::set_logger(unsafe {
