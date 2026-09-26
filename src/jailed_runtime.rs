@@ -1732,6 +1732,13 @@ impl Script {
                 let mut address = unsafe { params.read() };
                 let mut item_count = unsafe { params.add(1).read() } as usize;
 
+                if item_count > 256 {
+                    self.stop_with_error(format!(
+                        "Android menu requested {item_count} items; maximum safe count is 256"
+                    ));
+                    return Some(true);
+                }
+
                 let Some(flags) = self.read_virtual_u8(address) else {
                     self.stop_with_error("Android 0DF2 menu descriptor is invalid".to_string());
                     return Some(true);
@@ -1876,8 +1883,39 @@ impl Script {
             return true;
         }
 
+        if self.game.stack_pos as usize > self.game.call_stack.len() {
+            self.stop_with_error(format!(
+                "Invalid script call-stack depth {} before opcode {opcode:#06x}",
+                self.game.stack_pos
+            ));
+            return true;
+        }
+
         let handler: Handler = unsafe { std::mem::transmute(handler_addr) };
-        handler(&mut self.game, opcode) != 0
+        let interrupted = handler(&mut self.game, opcode) != 0;
+
+        let base = self.game.base_ip as usize;
+        let current = self.game.ip as usize;
+        let valid_ip = current
+            .checked_sub(base)
+            .map(|offset| offset <= self.bytes.len())
+            .unwrap_or(false);
+
+        if !valid_ip {
+            self.stop_with_error(format!(
+                "Opcode {opcode:#06x} moved the instruction pointer outside the script; quarantined"
+            ));
+            return true;
+        }
+
+        if self.game.stack_pos as usize > self.game.call_stack.len() {
+            self.stop_with_error(format!(
+                "Opcode {opcode:#06x} corrupted the script call stack; quarantined"
+            ));
+            return true;
+        }
+
+        interrupted
     }
 
     fn update(&mut self) {
@@ -1886,8 +1924,15 @@ impl Script {
         }
 
         if self.special == SpecialScript::Fps60 {
-            unsafe {
-                (absolute(FPS_CAP_ADDR) as *mut u32).write(60);
+            let cap = absolute(FPS_CAP_ADDR);
+            if segment_info(cap).map(|(_, writable, _)| writable).unwrap_or(false) {
+                unsafe {
+                    (cap as *mut u32).write(60);
+                }
+            } else {
+                self.stop_with_error(
+                    "60 FPS adapter could not verify the iOS frame-cap variable".to_string(),
+                );
             }
             return;
         }
@@ -2106,7 +2151,16 @@ pub fn tick() {
             continue;
         }
 
-        script.update();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            script.update();
+        }));
+
+        if result.is_err() {
+            script.stop_with_error(
+                "Script runtime panic was contained; script quarantined instead of crashing the app"
+                    .to_string(),
+            );
+        }
     }
 
     let pending = {
