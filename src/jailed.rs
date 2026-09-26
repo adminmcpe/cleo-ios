@@ -67,6 +67,24 @@ static TAB_BUTTONS: Lazy<Mutex<[usize; 4]>> = Lazy::new(|| Mutex::new([0; 4]));
 static SELECTED_TAB: AtomicUsize = AtomicUsize::new(TAG_TAB_CSI as usize);
 static TIMER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static ANDROID_MENU_OVERLAY: AtomicUsize = AtomicUsize::new(0);
+static SCRIPT_TEXT_OVERLAY: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScriptTextDraw {
+    pub x: f32,
+    pub y: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub rgba: [u8; 4],
+    pub centered: bool,
+    pub right_aligned: bool,
+    pub outline: bool,
+    pub text: String,
+}
+
+static LAST_SCRIPT_TEXT_FRAME: Lazy<Mutex<Vec<ScriptTextDraw>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
 
 #[derive(Debug)]
 struct AndroidMenuState {
@@ -126,6 +144,146 @@ fn clean_android_menu_text(value: &str) -> String {
     }
 
     out.trim().to_string()
+}
+
+
+fn clear_view_subviews(view: *mut Object) {
+    if view.is_null() {
+        return;
+    }
+
+    unsafe {
+        let subviews: *mut Object = msg_send![view, subviews];
+        let copied: *mut Object = msg_send![subviews, copy];
+        let count: usize = msg_send![copied, count];
+
+        for index in 0..count {
+            let child: *mut Object = msg_send![copied, objectAtIndex: index];
+            let _: () = msg_send![child, removeFromSuperview];
+        }
+
+        let _: () = msg_send![copied, release];
+    }
+}
+
+pub fn hide_script_text_overlay() {
+    LAST_SCRIPT_TEXT_FRAME.lock().unwrap().clear();
+
+    let current = SCRIPT_TEXT_OVERLAY.swap(0, Ordering::SeqCst);
+    if current == 0 {
+        return;
+    }
+
+    unsafe {
+        let view = current as *mut Object;
+        let _: () = msg_send![view, removeFromSuperview];
+        let _: () = msg_send![view, release];
+    }
+}
+
+pub fn render_script_text_frame(frame: Vec<ScriptTextDraw>) {
+    // The normal CLEO menu should always stay above script-owned HUD/menu text.
+    if OVERLAY.load(Ordering::SeqCst) != 0 || ANDROID_MENU_OVERLAY.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+
+    {
+        let mut last = LAST_SCRIPT_TEXT_FRAME.lock().unwrap();
+        if *last == frame {
+            return;
+        }
+        *last = frame.clone();
+    }
+
+    if frame.is_empty() {
+        hide_script_text_overlay();
+        return;
+    }
+
+    unsafe {
+        let app: *mut Object = msg_send![class!(UIApplication), sharedApplication];
+        let window: *mut Object = msg_send![app, keyWindow];
+        if window.is_null() {
+            return;
+        }
+
+        let bounds: CGRect = msg_send![window, bounds];
+        let overlay = {
+            let existing = SCRIPT_TEXT_OVERLAY.load(Ordering::SeqCst) as *mut Object;
+            if existing.is_null() {
+                let view: *mut Object = msg_send![class!(UIView), alloc];
+                let view: *mut Object = msg_send![view, initWithFrame: bounds];
+                let _: () = msg_send![view, setBackgroundColor: std::ptr::null_mut::<Object>()];
+                let _: () = msg_send![view, setUserInteractionEnabled: false];
+                let _: () = msg_send![window, addSubview: view];
+                SCRIPT_TEXT_OVERLAY.store(view as usize, Ordering::SeqCst);
+                view
+            } else {
+                let _: () = msg_send![existing, setFrame: bounds];
+                existing
+            }
+        };
+
+        clear_view_subviews(overlay);
+
+        // GTA:SA's script text/box coordinates use a 640x448 virtual canvas.
+        let sx = bounds.size.width / 640.0;
+        let sy = bounds.size.height / 448.0;
+
+        for item in frame {
+            let clean = clean_android_menu_text(&item.text);
+            if clean.is_empty() {
+                continue;
+            }
+
+            let mut alignment = 0i64; // left
+            let (virtual_x, virtual_width) = if item.right_aligned {
+                alignment = 2;
+                (item.x as f64 - 260.0, 260.0)
+            } else if item.centered && item.x >= 90.0 {
+                alignment = 1;
+                (item.x as f64 - 220.0, 440.0)
+            } else {
+                (item.x as f64, 360.0)
+            };
+
+            let font_size = (12.0 * item.scale_y.max(0.65) as f64).clamp(9.0, 30.0);
+            let x = virtual_x * sx;
+            let y = (item.y as f64 * sy) - font_size * 0.60;
+            let width = (virtual_width * sx).max(44.0);
+            let height = (font_size * 1.45).max(18.0);
+
+            let label: *mut Object = msg_send![class!(UILabel), alloc];
+            let label: *mut Object =
+                msg_send![label, initWithFrame: CGRect::new(x, y, width, height)];
+            let _: () = msg_send![label, setText: ns_string(&clean)];
+            let _: () = msg_send![label, setTextAlignment: alignment];
+            let _: () = msg_send![label, setNumberOfLines: 1i64];
+
+            let colour: *mut Object = msg_send![
+                class!(UIColor),
+                colorWithRed: item.rgba[0] as f64 / 255.0
+                green: item.rgba[1] as f64 / 255.0
+                blue: item.rgba[2] as f64 / 255.0
+                alpha: item.rgba[3] as f64 / 255.0
+            ];
+            let _: () = msg_send![label, setTextColor: colour];
+
+            let font: *mut Object =
+                msg_send![class!(UIFont), boldSystemFontOfSize: font_size];
+            let _: () = msg_send![label, setFont: font];
+
+            if item.outline {
+                let shadow: *mut Object =
+                    msg_send![class!(UIColor), colorWithWhite: 0.0f64 alpha: 1.0f64];
+                let _: () = msg_send![label, setShadowColor: shadow];
+                let _: () = msg_send![label, setShadowOffset: CGSize { width: 1.0, height: 1.0 }];
+            }
+
+            let _: () = msg_send![overlay, addSubview: label];
+            let _: () = msg_send![label, release];
+        }
+    }
 }
 
 const IOS_CLEO_ROW_HEIGHT: f64 = 50.0;
@@ -703,14 +861,19 @@ fn install_runtime_timer() {
     };
 
     unsafe {
-        let _: *mut Object = msg_send![
-            class!(NSTimer),
-            scheduledTimerWithTimeInterval: (1.0f64 / 60.0f64)
-            target: target as *mut Object
+        // Script text-draw opcodes are frame-scoped in GTA. Driving the jailed
+        // runtime from CADisplayLink keeps RZL-style menus in sync with the
+        // renderer instead of racing it from an independent NSTimer.
+        let link: *mut Object = msg_send![
+            class!(CADisplayLink),
+            displayLinkWithTarget: target as *mut Object
             selector: sel!(cleoRuntimeTick:)
-            userInfo: std::ptr::null_mut::<Object>()
-            repeats: true
         ];
+        let _: () = msg_send![link, setPreferredFramesPerSecond: 60i64];
+
+        let run_loop: *mut Object = msg_send![class!(NSRunLoop), mainRunLoop];
+        let mode = ns_string("NSRunLoopCommonModes");
+        let _: () = msg_send![link, addToRunLoop: run_loop forMode: mode];
     }
 }
 
@@ -944,6 +1107,8 @@ fn show_menu() {
     if OVERLAY.load(Ordering::SeqCst) != 0 {
         return;
     }
+
+    hide_script_text_overlay();
 
     unsafe {
         let app: *mut Object = msg_send![class!(UIApplication), sharedApplication];
