@@ -1,10 +1,5 @@
 //! Sets up CLEO when the library is loaded.
 
-#![feature(panic_info_message)]
-#![feature(cstr_from_bytes_until_nul)]
-#![feature(map_try_insert)]
-#![feature(drain_filter)]
-
 use ctor::ctor;
 use objc::runtime::Object;
 use objc::runtime::Sel;
@@ -14,6 +9,8 @@ mod game;
 mod hook;
 mod logging;
 mod meta;
+#[cfg(feature = "jailed")]
+mod jailed;
 
 mod targets {
     #![allow(clippy::unreadable_literal)]
@@ -109,14 +106,31 @@ fn load() {
     // Load the logging system before everything else so we can log from constructors.
     logging::init();
 
-    if hook::can_hook() {
-        log::info!("hook test successful! CLEO should work ok :)");
-    } else {
-        log::error!("hook test failed! CLEO probably won't work :( please report this error!");
+    #[cfg(feature = "jailed")]
+    {
+        log::info!("CLEO jailed proof-of-concept build starting.");
+        log::info!("Cargo package version is {}", env!("CARGO_PKG_VERSION"));
+
+        // The jailed build deliberately avoids hlhook / executable-memory patching.
+        // These Objective-C/UIKit pieces are known to work in the sideloaded app.
+        meta::settings::init();
+        meta::language::init();
+        meta::gui::init();
+        jailed::init();
+
+        return;
     }
 
-    log::info!(
-        r#"
+    #[cfg(not(feature = "jailed"))]
+    {
+        if hook::can_hook() {
+            log::info!("hook test successful! CLEO should work ok :)");
+        } else {
+            log::error!("hook test failed! CLEO probably won't work :( please report this error!");
+        }
+
+        log::info!(
+            r#"
 
                          Welcome to CLEO iOS!
              Written by @squ1dd13 (squ1dd13dev@gmail.com).
@@ -124,19 +138,16 @@ fn load() {
   Check out the GitHub repo at https://github.com/squ1dd13/CLEO-iOS.
  Need support? Join the Discord server! https://discord.gg/cXwkTUasJU
 "#
-    );
+        );
 
-    // todo: Log game version.
-    log::info!("Cargo package version is {}", env!("CARGO_PKG_VERSION"));
+        log::info!("Cargo package version is {}", env!("CARGO_PKG_VERSION"));
 
-    log::info!(
-        "game ASLR slide is {:#x}",
-        crate::hook::get_game_aslr_offset(),
-    );
+        log::info!(
+            "game ASLR slide is {:#x}",
+            crate::hook::get_game_aslr_offset(),
+        );
 
-    // Set up CLEO first.
-    meta::init();
-
-    // Load all of our game systems.
-    game::init();
+        meta::init();
+        game::init();
+    }
 }
