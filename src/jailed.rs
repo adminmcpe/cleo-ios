@@ -103,6 +103,31 @@ fn set_bg(view: *mut Object, white: f64, alpha: f64) {
     }
 }
 
+fn clean_android_menu_text(value: &str) -> String {
+    // Android CLEO/GTA font strings contain formatting tokens such as ~h~,
+    // ~y~, ~g~, ~r~, ~s~ and substitution markers such as ~1~. UIKit does
+    // not interpret them, so strip only short tilde-delimited control tokens.
+    // Malformed/ordinary tildes are preserved.
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if chars[i] == '~' {
+            let max_end = (i + 13).min(chars.len());
+            if let Some(end) = ((i + 1)..max_end).find(|&j| chars[j] == '~') {
+                i = end + 1;
+                continue;
+            }
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out.trim().to_string()
+}
+
 const IOS_CLEO_ROW_HEIGHT: f64 = 50.0;
 const IOS_CLEO_TAB_HEIGHT: f64 = 50.0;
 const IOS_CLEO_CLOSE_HEIGHT: f64 = 35.0;
@@ -737,6 +762,16 @@ fn add_android_menu_button(
         let _: () = msg_send![button, setTag: tag];
         set_bg(button, 1.0, 0.10);
 
+        // UIButton's inherited/default title colour is not reliable over our
+        // dark compatibility overlay on recent iOS versions. Force readable
+        // colours explicitly for Android CLEO menus.
+        let normal_colour: *mut Object =
+            msg_send![class!(UIColor), colorWithWhite: 1.0f64 alpha: 0.96f64];
+        let pressed_colour: *mut Object =
+            msg_send![class!(UIColor), colorWithWhite: 1.0f64 alpha: 1.0f64];
+        let _: () = msg_send![button, setTitleColor: normal_colour forState: 0u64];
+        let _: () = msg_send![button, setTitleColor: pressed_colour forState: 1u64];
+
         let label: *mut Object = msg_send![button, titleLabel];
         let font: *mut Object = msg_send![class!(UIFont), systemFontOfSize: 17.0f64];
         let _: () = msg_send![label, setFont: font];
@@ -756,6 +791,13 @@ fn add_android_menu_button(
 
 pub fn show_android_menu(title: String, close_title: String, items: Vec<String>) {
     hide_android_menu();
+
+    let title = clean_android_menu_text(&title);
+    let close_title = clean_android_menu_text(&close_title);
+    let items: Vec<String> = items
+        .into_iter()
+        .map(|item| clean_android_menu_text(&item))
+        .collect();
 
     unsafe {
         let app: *mut Object = msg_send![class!(UIApplication), sharedApplication];
@@ -830,6 +872,9 @@ pub fn show_android_menu(title: String, close_title: String, items: Vec<String>)
         ];
         let _: () = msg_send![close, setTitle: ns_string(&close_title) forState: 0u64];
         let _: () = msg_send![close, setTag: TAG_ANDROID_CLOSE];
+        let close_colour: *mut Object =
+            msg_send![class!(UIColor), colorWithWhite: 1.0f64 alpha: 1.0f64];
+        let _: () = msg_send![close, setTitleColor: close_colour forState: 0u64];
         let red: *mut Object =
             msg_send![class!(UIColor), colorWithRed: 1.0f64 green: 0.20f64 blue: 0.25f64 alpha: 0.36f64];
         let _: () = msg_send![close, setBackgroundColor: red];
