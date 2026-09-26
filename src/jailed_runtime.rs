@@ -881,10 +881,10 @@ impl Script {
             bytes,
             game: GameScript::new(ip, false),
             name,
-            // Safe-start on jailed iOS: do not auto-run newly discovered CSA files.
-            // Android CSA mods can execute native code/memory operations immediately when
-            // gameplay begins. They remain listed in the CSA tab and can be enabled manually.
-            enabled: false,
+            // Keep arbitrary Android CSA scripts on safe-start, but the known
+            // 60 FPS compatibility adapter is an iOS-side cap writer and is safe to
+            // enable automatically just like original CLEO iOS defaults to 60 FPS.
+            enabled: special == SpecialScript::Fps60,
             error: None,
             virtual_base: NEXT_SCRIPT_VBASE.fetch_add(SCRIPT_VIRTUAL_STRIDE, Ordering::SeqCst),
             context: [0; 32],
@@ -2115,11 +2115,14 @@ fn begin_game_session() {
 
     let mut scripts = SCRIPTS.lock().unwrap();
 
-    // Never run any script on the exact frame GTA enters gameplay.
-    // CSI stays idle until tapped; CSA that the user explicitly enabled is
-    // started after a short delay once the world/player state has settled.
+    // Never run arbitrary Android scripts on the exact frame GTA enters
+    // gameplay. The 60 FPS adapter is different: it executes no Android
+    // bytecode and only writes the verified iOS frame-cap variable, so it can
+    // be active immediately and keep the cap pinned from the first game frame.
     for script in scripts.iter_mut() {
-        script.reset(false);
+        let active_now =
+            script.enabled && script.special == SpecialScript::Fps60;
+        script.reset(active_now);
     }
 }
 
@@ -2262,7 +2265,23 @@ pub fn activate_csi(index: usize) -> bool {
         return false;
     };
 
-    script.reset(true);
+    // Never restart a CSI while its previous invocation is still alive.
+    // Resetting GameScript in the middle of VehicleSpawn/other menu scripts can
+    // invalidate their model/menu state and is a direct crash risk.
+    if script.game.active {
+        return false;
+    }
+
+    // A normal CSI termination (004E) already resets IP/locals to the start.
+    // Match original CLEO iOS semantics and simply reactivate it. Only perform
+    // a full reset when retrying a script that previously stopped with an error.
+    if script.error.is_some() {
+        crate::jailed::hide_android_menu();
+        script.reset(true);
+    } else {
+        script.game.active = true;
+    }
+
     true
 }
 
