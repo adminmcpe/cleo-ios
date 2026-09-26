@@ -1900,6 +1900,7 @@ pub fn reload_scripts() {
 }
 
 fn begin_game_session() {
+    *WAYPOINT_SCAN_CACHE.lock().unwrap() = (u32::MAX, None);
     let mut scripts = SCRIPTS.lock().unwrap();
 
     for script in scripts.iter_mut() {
@@ -1911,6 +1912,7 @@ fn begin_game_session() {
 }
 
 fn end_game_session() {
+    *WAYPOINT_SCAN_CACHE.lock().unwrap() = (u32::MAX, None);
     let mut scripts = SCRIPTS.lock().unwrap();
     for script in scripts.iter_mut() {
         script.game.active = false;
