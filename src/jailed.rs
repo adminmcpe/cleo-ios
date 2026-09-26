@@ -1,8 +1,7 @@
 //! Jailbreak-free CLEO menu proof-of-concept.
 //!
 //! This build intentionally avoids executable-memory/game-code hooks. It recreates
-//! CLEO's UIKit menu shell and discovers .csi/.csa files from Documents/CLEO.
-//! Script execution will be added only after this UI build is verified stable.
+//! CLEO's UIKit menu shell and connects it to the jailed CSI/CSA runtime.
 
 use objc::{
     class,
@@ -14,9 +13,7 @@ use objc::{
 use once_cell::sync::OnceCell;
 use std::{
     ffi::CString,
-    fs,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 #[repr(C)]
@@ -54,54 +51,20 @@ const TAG_TAB_CSI: i64 = 10;
 const TAG_TAB_CSA: i64 = 11;
 const TAG_TAB_CHEATS: i64 = 12;
 const TAG_TAB_OPTIONS: i64 = 13;
+const TAG_CSI_BASE: i64 = 1000;
+const TAG_CSA_BASE: i64 = 2000;
 
 static GESTURE_TARGET: OnceCell<usize> = OnceCell::new();
 static OVERLAY: AtomicUsize = AtomicUsize::new(0);
 static CONTENT_VIEW: AtomicUsize = AtomicUsize::new(0);
 static SELECTED_TAB: AtomicUsize = AtomicUsize::new(TAG_TAB_CSI as usize);
+static TIMER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 fn ns_string(value: &str) -> *const Object {
     unsafe {
         let value = CString::new(value).unwrap_or_else(|_| CString::new("?").unwrap());
         msg_send![class!(NSString), stringWithUTF8String: value.as_ptr()]
     }
-}
-
-fn documents_cleo_dir() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.set_file_name("Documents");
-    path.push("CLEO");
-    path
-}
-
-fn script_names(extension: &str) -> Vec<String> {
-    let dir = documents_cleo_dir();
-    let _ = fs::create_dir_all(&dir);
-
-    let mut names = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file()
-                && path
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map(|x| x.eq_ignore_ascii_case(extension))
-                    .unwrap_or(false)
-            {
-                names.push(
-                    path.file_name()
-                        .and_then(|x| x.to_str())
-                        .unwrap_or("Unnamed")
-                        .to_string(),
-                );
-            }
-        }
-    }
-
-    names.sort_by_key(|s| s.to_lowercase());
-    names
 }
 
 fn set_bg(view: *mut Object, white: f64, alpha: f64) {
@@ -180,8 +143,68 @@ fn add_row(parent: *mut Object, y: f64, width: f64, title: &str, detail: &str, v
     }
 }
 
+fn add_action_row(
+    parent: *mut Object,
+    target: *mut Object,
+    y: f64,
+    width: f64,
+    title: &str,
+    detail: &str,
+    value: &str,
+    tag: i64,
+) {
+    unsafe {
+        let row = CGRect::new(width * 0.03, y, width * 0.94, 72.0);
+
+        let button: *mut Object = msg_send![class!(UIButton), alloc];
+        let button: *mut Object = msg_send![button, initWithFrame: row];
+        let _: () = msg_send![button, setTag: tag];
+        set_bg(button, 1.0, 0.08);
+
+        add_label(
+            button,
+            CGRect::new(14.0, 7.0, row.size.width * 0.58, 27.0),
+            title,
+            18.0,
+            0,
+            0.96,
+        );
+        add_label(
+            button,
+            CGRect::new(14.0, 35.0, row.size.width * 0.68, 28.0),
+            detail,
+            12.0,
+            0,
+            0.58,
+        );
+        add_label(
+            button,
+            CGRect::new(row.size.width * 0.70, 7.0, row.size.width * 0.26, 54.0),
+            value,
+            15.0,
+            2,
+            0.90,
+        );
+
+        let _: () = msg_send![
+            button,
+            addTarget: target
+            action: sel!(handleCleoMenuButton:)
+            forControlEvents: 1u64 << 6
+        ];
+
+        let _: () = msg_send![parent, addSubview: button];
+        let _: () = msg_send![button, release];
+    }
+}
+
 fn add_script_rows(parent: *mut Object, width: f64, extension: &str) {
-    let scripts = script_names(extension);
+    let is_csa = extension.eq_ignore_ascii_case("csa");
+    let scripts = if is_csa {
+        crate::jailed_runtime::csa_statuses()
+    } else {
+        crate::jailed_runtime::csi_statuses()
+    };
 
     if scripts.is_empty() {
         add_label(
@@ -195,19 +218,42 @@ fn add_script_rows(parent: *mut Object, width: f64, extension: &str) {
         return;
     }
 
+    let target = GESTURE_TARGET
+        .get()
+        .copied()
+        .unwrap_or(0) as *mut Object;
+
     let mut y = 78.0;
-    for name in scripts.into_iter().take(12) {
-        add_row(
+    for (index, script) in scripts.into_iter().take(12).enumerate() {
+        let (detail, value) = if let Some(error) = &script.error {
+            (error.as_str(), "Error")
+        } else if is_csa {
+            (
+                "Startup script - tap to enable/disable",
+                if script.enabled { "Enabled" } else { "Disabled" },
+            )
+        } else {
+            (
+                "Invoked script - tap to run",
+                if script.active { "Running" } else { "Not running" },
+            )
+        };
+
+        let tag = if is_csa {
+            TAG_CSA_BASE + index as i64
+        } else {
+            TAG_CSI_BASE + index as i64
+        };
+
+        add_action_row(
             parent,
+            target,
             y,
             width,
-            &name,
-            if extension.eq_ignore_ascii_case("csa") {
-                "Startup script"
-            } else {
-                "Invoked script"
-            },
-            "Found",
+            &script.name,
+            detail,
+            value,
+            tag,
         );
         y += 78.0;
     }
@@ -316,8 +362,8 @@ fn render_selected_tab() {
                     156.0,
                     width,
                     "Runtime Mode",
-                    "No jailbreak / no executable-memory hooks",
-                    "Jailed",
+                    "UIKit timer + native SCM opcode handlers",
+                    if crate::jailed_runtime::is_in_game() { "Jailed / In Game" } else { "Jailed / Waiting" },
                 );
                 add_row(
                     content,
@@ -336,6 +382,10 @@ extern "C" fn handle_cleo_swipe(_this: &Object, _cmd: Sel, _gesture: *mut Object
     toggle_menu();
 }
 
+extern "C" fn runtime_timer_tick(_this: &Object, _cmd: Sel, _timer: *mut Object) {
+    crate::jailed_runtime::tick();
+}
+
 extern "C" fn handle_menu_button(_this: &Object, _cmd: Sel, button: *mut Object) {
     unsafe {
         let tag: i64 = msg_send![button, tag];
@@ -347,6 +397,23 @@ extern "C" fn handle_menu_button(_this: &Object, _cmd: Sel, button: *mut Object)
 
         if (TAG_TAB_CSI..=TAG_TAB_OPTIONS).contains(&tag) {
             SELECTED_TAB.store(tag as usize, Ordering::SeqCst);
+            render_selected_tab();
+            return;
+        }
+
+        if (TAG_CSI_BASE..TAG_CSA_BASE).contains(&tag) {
+            let index = (tag - TAG_CSI_BASE) as usize;
+            if crate::jailed_runtime::activate_csi(index) {
+                hide_menu();
+            } else {
+                render_selected_tab();
+            }
+            return;
+        }
+
+        if (TAG_CSA_BASE..(TAG_CSA_BASE + 1000)).contains(&tag) {
+            let index = (tag - TAG_CSA_BASE) as usize;
+            crate::jailed_runtime::toggle_csa(index);
             render_selected_tab();
         }
     }
@@ -367,6 +434,10 @@ fn target_class() -> &'static runtime::Class {
             decl.add_method(
                 sel!(handleCleoMenuButton:),
                 handle_menu_button as extern "C" fn(&Object, Sel, *mut Object),
+            );
+            decl.add_method(
+                sel!(cleoRuntimeTick:),
+                runtime_timer_tick as extern "C" fn(&Object, Sel, *mut Object),
             );
         }
 
@@ -395,6 +466,28 @@ fn install_swipe_gesture() {
         let _: () = msg_send![recognizer, release];
 
         let _ = GESTURE_TARGET.set(target as usize);
+    }
+}
+
+fn install_runtime_timer() {
+    if TIMER_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let Some(target) = GESTURE_TARGET.get().copied() else {
+        TIMER_INSTALLED.store(false, Ordering::SeqCst);
+        return;
+    };
+
+    unsafe {
+        let _: *mut Object = msg_send![
+            class!(NSTimer),
+            scheduledTimerWithTimeInterval: (1.0f64 / 60.0f64)
+            target: target as *mut Object
+            selector: sel!(cleoRuntimeTick:)
+            userInfo: std::ptr::null_mut::<Object>()
+            repeats: true
+        ];
     }
 }
 
@@ -564,6 +657,8 @@ extern "C" fn legal_splash_did_load(this: &mut Object, _cmd: Sel) {
     }
 
     install_swipe_gesture();
+    crate::jailed_runtime::init();
+    install_runtime_timer();
 }
 
 fn hook_legal_splash() {
