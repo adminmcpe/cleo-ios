@@ -1,7 +1,8 @@
-//! Minimal jailbreak-free proof of concept.
+//! Jailbreak-free CLEO menu proof-of-concept.
 //!
-//! No game code is patched here. The only hook is Objective-C method swizzling,
-//! which already proved functional in the user's CLEO 2.6.0 log.
+//! This build intentionally avoids executable-memory/game-code hooks. It recreates
+//! CLEO's UIKit menu shell and discovers .csi/.csa files from Documents/CLEO.
+//! Script execution will be added only after this UI build is verified stable.
 
 use objc::{
     class,
@@ -13,6 +14,8 @@ use objc::{
 use once_cell::sync::OnceCell;
 use std::{
     ffi::CString,
+    fs,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -46,31 +49,324 @@ impl CGRect {
     }
 }
 
+const TAG_CLOSE: i64 = 1;
+const TAG_TAB_CSI: i64 = 10;
+const TAG_TAB_CSA: i64 = 11;
+const TAG_TAB_CHEATS: i64 = 12;
+const TAG_TAB_OPTIONS: i64 = 13;
+
 static GESTURE_TARGET: OnceCell<usize> = OnceCell::new();
 static OVERLAY: AtomicUsize = AtomicUsize::new(0);
+static CONTENT_VIEW: AtomicUsize = AtomicUsize::new(0);
+static SELECTED_TAB: AtomicUsize = AtomicUsize::new(TAG_TAB_CSI as usize);
 
 fn ns_string(value: &str) -> *const Object {
     unsafe {
-        let value = CString::new(value).unwrap();
+        let value = CString::new(value).unwrap_or_else(|_| CString::new("?").unwrap());
         msg_send![class!(NSString), stringWithUTF8String: value.as_ptr()]
     }
 }
 
-extern "C" fn handle_cleo_swipe(_this: &Object, _cmd: Sel, _gesture: *mut Object) {
-    toggle_test_menu();
+fn documents_cleo_dir() -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.set_file_name("Documents");
+    path.push("CLEO");
+    path
 }
 
-fn gesture_target_class() -> &'static runtime::Class {
+fn script_names(extension: &str) -> Vec<String> {
+    let dir = documents_cleo_dir();
+    let _ = fs::create_dir_all(&dir);
+
+    let mut names = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case(extension))
+                    .unwrap_or(false)
+            {
+                names.push(
+                    path.file_name()
+                        .and_then(|x| x.to_str())
+                        .unwrap_or("Unnamed")
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    names.sort_by_key(|s| s.to_lowercase());
+    names
+}
+
+fn set_bg(view: *mut Object, white: f64, alpha: f64) {
+    unsafe {
+        let colour: *mut Object =
+            msg_send![class!(UIColor), colorWithWhite: white alpha: alpha];
+        let _: () = msg_send![view, setBackgroundColor: colour];
+    }
+}
+
+fn add_label(
+    parent: *mut Object,
+    frame: CGRect,
+    text: &str,
+    size: f64,
+    alignment: i64,
+    alpha: f64,
+) -> *mut Object {
+    unsafe {
+        let label: *mut Object = msg_send![class!(UILabel), alloc];
+        let label: *mut Object = msg_send![label, initWithFrame: frame];
+
+        let _: () = msg_send![label, setText: ns_string(text)];
+        let _: () = msg_send![label, setNumberOfLines: 0i64];
+        let _: () = msg_send![label, setTextAlignment: alignment];
+
+        let colour: *mut Object =
+            msg_send![class!(UIColor), colorWithWhite: 1.0f64 alpha: alpha];
+        let _: () = msg_send![label, setTextColor: colour];
+
+        let font: *mut Object = msg_send![class!(UIFont), systemFontOfSize: size];
+        let _: () = msg_send![label, setFont: font];
+
+        let _: () = msg_send![parent, addSubview: label];
+        let _: () = msg_send![label, release];
+
+        label
+    }
+}
+
+fn add_row(parent: *mut Object, y: f64, width: f64, title: &str, detail: &str, value: &str) {
+    unsafe {
+        let row = CGRect::new(width * 0.03, y, width * 0.94, 72.0);
+
+        let container: *mut Object = msg_send![class!(UIView), alloc];
+        let container: *mut Object = msg_send![container, initWithFrame: row];
+        set_bg(container, 1.0, 0.08);
+
+        add_label(
+            container,
+            CGRect::new(14.0, 7.0, row.size.width * 0.58, 27.0),
+            title,
+            18.0,
+            0,
+            0.96,
+        );
+        add_label(
+            container,
+            CGRect::new(14.0, 35.0, row.size.width * 0.68, 28.0),
+            detail,
+            12.0,
+            0,
+            0.58,
+        );
+        add_label(
+            container,
+            CGRect::new(row.size.width * 0.70, 7.0, row.size.width * 0.26, 54.0),
+            value,
+            15.0,
+            2,
+            0.90,
+        );
+
+        let _: () = msg_send![parent, addSubview: container];
+        let _: () = msg_send![container, release];
+    }
+}
+
+fn add_script_rows(parent: *mut Object, width: f64, extension: &str) {
+    let scripts = script_names(extension);
+
+    if scripts.is_empty() {
+        add_label(
+            parent,
+            CGRect::new(width * 0.06, 95.0, width * 0.88, 100.0),
+            &format!("No .{} scripts found in Documents/CLEO.", extension),
+            17.0,
+            1,
+            0.72,
+        );
+        return;
+    }
+
+    let mut y = 78.0;
+    for name in scripts.into_iter().take(12) {
+        add_row(
+            parent,
+            y,
+            width,
+            &name,
+            if extension.eq_ignore_ascii_case("csa") {
+                "Startup script"
+            } else {
+                "Invoked script"
+            },
+            "Found",
+        );
+        y += 78.0;
+    }
+}
+
+fn clear_content() {
+    let content = CONTENT_VIEW.load(Ordering::SeqCst) as *mut Object;
+    if content.is_null() {
+        return;
+    }
+
+    unsafe {
+        let subviews: *mut Object = msg_send![content, subviews];
+        let copied: *mut Object = msg_send![subviews, copy];
+        let count: usize = msg_send![copied, count];
+
+        for i in 0..count {
+            let view: *mut Object = msg_send![copied, objectAtIndex: i];
+            let _: () = msg_send![view, removeFromSuperview];
+        }
+
+        let _: () = msg_send![copied, release];
+    }
+}
+
+fn render_selected_tab() {
+    let content = CONTENT_VIEW.load(Ordering::SeqCst) as *mut Object;
+    if content.is_null() {
+        return;
+    }
+
+    clear_content();
+
+    unsafe {
+        let bounds: CGRect = msg_send![content, bounds];
+        let width = bounds.size.width;
+
+        match SELECTED_TAB.load(Ordering::SeqCst) as i64 {
+            TAG_TAB_CSI => {
+                add_label(
+                    content,
+                    CGRect::new(width * 0.04, 14.0, width * 0.92, 48.0),
+                    "CSI Scripts",
+                    28.0,
+                    0,
+                    1.0,
+                );
+                add_script_rows(content, width, "csi");
+            }
+            TAG_TAB_CSA => {
+                add_label(
+                    content,
+                    CGRect::new(width * 0.04, 14.0, width * 0.92, 48.0),
+                    "CSA Scripts",
+                    28.0,
+                    0,
+                    1.0,
+                );
+                add_script_rows(content, width, "csa");
+            }
+            TAG_TAB_CHEATS => {
+                add_label(
+                    content,
+                    CGRect::new(width * 0.04, 14.0, width * 0.92, 48.0),
+                    "Cheats",
+                    28.0,
+                    0,
+                    1.0,
+                );
+                add_row(
+                    content,
+                    78.0,
+                    width,
+                    "Built-in cheat runtime",
+                    "Next porting stage after menu validation",
+                    "Pending",
+                );
+                add_row(
+                    content,
+                    156.0,
+                    width,
+                    "Game-safe execution",
+                    "Will use a UIKit-driven tick instead of hlhook",
+                    "Pending",
+                );
+            }
+            _ => {
+                add_label(
+                    content,
+                    CGRect::new(width * 0.04, 14.0, width * 0.92, 48.0),
+                    "Options",
+                    28.0,
+                    0,
+                    1.0,
+                );
+                add_row(
+                    content,
+                    78.0,
+                    width,
+                    "Menu Gesture",
+                    "Gesture used to open the CLEO menu",
+                    "Swipe Down",
+                );
+                add_row(
+                    content,
+                    156.0,
+                    width,
+                    "Runtime Mode",
+                    "No jailbreak / no executable-memory hooks",
+                    "Jailed",
+                );
+                add_row(
+                    content,
+                    234.0,
+                    width,
+                    "CLEO Base",
+                    "Source branch used for this port",
+                    "2.6.0",
+                );
+            }
+        }
+    }
+}
+
+extern "C" fn handle_cleo_swipe(_this: &Object, _cmd: Sel, _gesture: *mut Object) {
+    toggle_menu();
+}
+
+extern "C" fn handle_menu_button(_this: &Object, _cmd: Sel, button: *mut Object) {
+    unsafe {
+        let tag: i64 = msg_send![button, tag];
+
+        if tag == TAG_CLOSE {
+            hide_menu();
+            return;
+        }
+
+        if (TAG_TAB_CSI..=TAG_TAB_OPTIONS).contains(&tag) {
+            SELECTED_TAB.store(tag as usize, Ordering::SeqCst);
+            render_selected_tab();
+        }
+    }
+}
+
+fn target_class() -> &'static runtime::Class {
     static CLASS: OnceCell<&'static runtime::Class> = OnceCell::new();
 
     CLASS.get_or_init(|| {
         let mut decl =
-            ClassDecl::new("CLEOJailedGestureTarget", class!(NSObject)).expect("class allocation failed");
+            ClassDecl::new("CLEOJailedUITarget", class!(NSObject)).expect("class allocation failed");
 
         unsafe {
             decl.add_method(
                 sel!(handleCleoSwipe:),
                 handle_cleo_swipe as extern "C" fn(&Object, Sel, *mut Object),
+            );
+            decl.add_method(
+                sel!(handleCleoMenuButton:),
+                handle_menu_button as extern "C" fn(&Object, Sel, *mut Object),
             );
         }
 
@@ -87,14 +383,12 @@ fn install_swipe_gesture() {
             return;
         }
 
-        let target_class = gesture_target_class();
-        let target: *mut Object = msg_send![target_class, new];
+        let target: *mut Object = msg_send![target_class(), new];
 
         let recognizer: *mut Object = msg_send![class!(UISwipeGestureRecognizer), alloc];
         let recognizer: *mut Object =
             msg_send![recognizer, initWithTarget: target action: sel!(handleCleoSwipe:)];
 
-        // UISwipeGestureRecognizerDirectionDown.
         let _: () = msg_send![recognizer, setDirection: 8usize];
         let _: () = msg_send![recognizer, setCancelsTouchesInView: false];
         let _: () = msg_send![window, addGestureRecognizer: recognizer];
@@ -104,18 +398,42 @@ fn install_swipe_gesture() {
     }
 }
 
-fn toggle_test_menu() {
+fn add_tab_button(
+    parent: *mut Object,
+    target: *mut Object,
+    frame: CGRect,
+    title: &str,
+    tag: i64,
+) {
     unsafe {
-        let current = OVERLAY.load(Ordering::SeqCst);
+        let button: *mut Object = msg_send![class!(UIButton), alloc];
+        let button: *mut Object = msg_send![button, initWithFrame: frame];
+        let _: () = msg_send![button, setTitle: ns_string(title) forState: 0u64];
+        let _: () = msg_send![button, setTag: tag];
+        set_bg(button, 1.0, 0.12);
 
-        if current != 0 {
-            let view = current as *mut Object;
-            let _: () = msg_send![view, removeFromSuperview];
-            let _: () = msg_send![view, release];
-            OVERLAY.store(0, Ordering::SeqCst);
-            return;
-        }
+        let label: *mut Object = msg_send![button, titleLabel];
+        let font: *mut Object = msg_send![class!(UIFont), boldSystemFontOfSize: 15.0f64];
+        let _: () = msg_send![label, setFont: font];
 
+        let _: () = msg_send![
+            button,
+            addTarget: target
+            action: sel!(handleCleoMenuButton:)
+            forControlEvents: 1u64 << 6
+        ];
+
+        let _: () = msg_send![parent, addSubview: button];
+        let _: () = msg_send![button, release];
+    }
+}
+
+fn show_menu() {
+    if OVERLAY.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+
+    unsafe {
         let app: *mut Object = msg_send![class!(UIApplication), sharedApplication];
         let window: *mut Object = msg_send![app, keyWindow];
 
@@ -127,44 +445,121 @@ fn toggle_test_menu() {
 
         let overlay: *mut Object = msg_send![class!(UIView), alloc];
         let overlay: *mut Object = msg_send![overlay, initWithFrame: bounds];
+        set_bg(overlay, 0.0, 0.78);
 
-        let background: *mut Object =
-            msg_send![class!(UIColor), colorWithWhite: 0.0f64 alpha: 0.82f64];
-        let _: () = msg_send![overlay, setBackgroundColor: background];
+        let target = GESTURE_TARGET
+            .get()
+            .copied()
+            .unwrap_or_else(|| {
+                let t: *mut Object = msg_send![target_class(), new];
+                t as usize
+            }) as *mut Object;
 
-        let frame = CGRect::new(
-            bounds.size.width * 0.08,
-            bounds.size.height * 0.28,
-            bounds.size.width * 0.84,
-            bounds.size.height * 0.44,
+        let tab_h = 54.0;
+        let close_h = 58.0;
+        let tab_w = bounds.size.width / 4.0;
+
+        add_tab_button(
+            overlay,
+            target,
+            CGRect::new(0.0, 0.0, tab_w, tab_h),
+            "CSI",
+            TAG_TAB_CSI,
+        );
+        add_tab_button(
+            overlay,
+            target,
+            CGRect::new(tab_w, 0.0, tab_w, tab_h),
+            "CSA",
+            TAG_TAB_CSA,
+        );
+        add_tab_button(
+            overlay,
+            target,
+            CGRect::new(tab_w * 2.0, 0.0, tab_w, tab_h),
+            "Cheats",
+            TAG_TAB_CHEATS,
+        );
+        add_tab_button(
+            overlay,
+            target,
+            CGRect::new(tab_w * 3.0, 0.0, tab_w, tab_h),
+            "Options",
+            TAG_TAB_OPTIONS,
         );
 
-        let label: *mut Object = msg_send![class!(UILabel), alloc];
-        let label: *mut Object = msg_send![label, initWithFrame: frame];
-        let _: () = msg_send![
-            label,
-            setText: ns_string("CLEO Jailed Menu\n\nSwipe gesture works.\nSwipe down again to close.")
+        let content_frame =
+            CGRect::new(0.0, tab_h, bounds.size.width, bounds.size.height - tab_h - close_h);
+        let content: *mut Object = msg_send![class!(UIView), alloc];
+        let content: *mut Object = msg_send![content, initWithFrame: content_frame];
+        set_bg(content, 0.0, 0.16);
+        let _: () = msg_send![overlay, addSubview: content];
+        CONTENT_VIEW.store(content as usize, Ordering::SeqCst);
+        let _: () = msg_send![content, release];
+
+        let close: *mut Object = msg_send![class!(UIButton), alloc];
+        let close: *mut Object = msg_send![
+            close,
+            initWithFrame: CGRect::new(
+                0.0,
+                bounds.size.height - close_h,
+                bounds.size.width,
+                close_h
+            )
         ];
-        let _: () = msg_send![label, setNumberOfLines: 0i64];
-        let _: () = msg_send![label, setTextAlignment: 1i64];
+        let _: () = msg_send![close, setTitle: ns_string("Close") forState: 0u64];
+        let _: () = msg_send![close, setTag: TAG_CLOSE];
 
-        let white: *mut Object = msg_send![class!(UIColor), whiteColor];
-        let _: () = msg_send![label, setTextColor: white];
+        let red: *mut Object =
+            msg_send![class!(UIColor), colorWithRed: 1.0f64 green: 0.23f64 blue: 0.30f64 alpha: 0.38f64];
+        let _: () = msg_send![close, setBackgroundColor: red];
 
-        let font: *mut Object = msg_send![class!(UIFont), boldSystemFontOfSize: 24.0f64];
-        let _: () = msg_send![label, setFont: font];
+        let close_label: *mut Object = msg_send![close, titleLabel];
+        let close_font: *mut Object = msg_send![class!(UIFont), boldSystemFontOfSize: 18.0f64];
+        let _: () = msg_send![close_label, setFont: close_font];
 
-        let _: () = msg_send![overlay, addSubview: label];
-        let _: () = msg_send![label, release];
+        let _: () = msg_send![
+            close,
+            addTarget: target
+            action: sel!(handleCleoMenuButton:)
+            forControlEvents: 1u64 << 6
+        ];
+
+        let _: () = msg_send![overlay, addSubview: close];
+        let _: () = msg_send![close, release];
+
         let _: () = msg_send![window, addSubview: overlay];
 
         OVERLAY.store(overlay as usize, Ordering::SeqCst);
+        render_selected_tab();
+    }
+}
+
+fn hide_menu() {
+    let current = OVERLAY.swap(0, Ordering::SeqCst);
+    CONTENT_VIEW.store(0, Ordering::SeqCst);
+
+    if current == 0 {
+        return;
+    }
+
+    unsafe {
+        let view = current as *mut Object;
+        let _: () = msg_send![view, removeFromSuperview];
+        let _: () = msg_send![view, release];
+    }
+}
+
+fn toggle_menu() {
+    if OVERLAY.load(Ordering::SeqCst) == 0 {
+        show_menu();
+    } else {
+        hide_menu();
     }
 }
 
 extern "C" fn legal_splash_did_load(this: &mut Object, _cmd: Sel) {
     unsafe {
-        // Call the original implementation after method exchange.
         let _: () = msg_send![this, cleoJailedOriginalViewDidLoad];
     }
 
@@ -182,8 +577,8 @@ fn hook_legal_splash() {
 
         let target_sel = sel!(viewDidLoad);
         let original_sel = sel!(cleoJailedOriginalViewDidLoad);
-
         let target_method = runtime::class_getInstanceMethod(class, target_sel);
+
         if target_method.is_null() {
             return;
         }
