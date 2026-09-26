@@ -990,7 +990,7 @@ impl Script {
         // Never execute script bytes or writable/data mappings as code.
         // Android 0DD2/0DDE scripts frequently manipulate pointers; treating an
         // arbitrary virtual address as a callable function is an immediate crash.
-        is_executable_address(real).then_some(real)
+        is_safe_callable(real).then_some(real)
     }
 
     fn call_integer_function(&mut self, address: u32, args: &[u64]) -> Option<u64> {
