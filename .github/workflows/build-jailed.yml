@@ -1,0 +1,33 @@
+name: Build CLEO Jailed
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - jailed-menu-fix
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Build jailed dylib
+        run: |
+          cargo build --release --features jailed --target aarch64-apple-ios
+          cp target/aarch64-apple-ios/release/libcleo.dylib CLEO_Jailed.dylib
+          file CLEO_Jailed.dylib
+          ls -lh CLEO_Jailed.dylib
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: CLEO_Jailed
+          path: CLEO_Jailed.dylib
