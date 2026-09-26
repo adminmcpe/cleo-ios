@@ -23,6 +23,9 @@ const EXTENDED_HANDLER_ADDR: usize = 0x10020980c;
 const COLLECT_PARAMETERS_ADDR: usize = 0x1001cf474;
 const GET_POINTER_TO_VARIABLE_ADDR: usize = 0x1001cfb04;
 const SCRIPT_PARAMS_ADDR: usize = 0x1007ad690;
+const UPDATE_COMPARE_FLAG_ADDR: usize = 0x1001df890;
+
+const ANDROID_IMAGE_VBASE: u32 = 0xB000_0000;
 
 const MAX_INSTRUCTIONS_PER_TICK: usize = 512;
 const SCRIPT_VIRTUAL_STRIDE: u32 = 0x0010_0000;
@@ -67,8 +70,37 @@ static NEXT_SCRIPT_VBASE: AtomicU32 = AtomicU32::new(0xE000_0000);
 static NEXT_SYMBOL_VBASE: AtomicU32 = AtomicU32::new(0xD000_0000);
 static SYMBOL_REGIONS: Lazy<Mutex<Vec<AddressRegion>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static MUTEX_VARS: Lazy<Mutex<HashMap<u32, u32>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static FXT_MAP: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static NEXT_FUNCTION_TOKEN: AtomicU32 = AtomicU32::new(0xC000_0000);
+static FUNCTION_TOKENS: Lazy<Mutex<HashMap<u32, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static PENDING_INVOKES: Lazy<Mutex<Vec<usize>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
-fn register_symbol_region(name: &str, real_base: usize, writable: bool) -> u32 {
+fn register_function_token(real: usize) -> u32 {
+    if real == 0 {
+        return 0;
+    }
+
+    let mut functions = FUNCTION_TOKENS.lock().unwrap();
+    if let Some((token, _)) = functions.iter().find(|(_, addr)| **addr == real) {
+        return *token;
+    }
+
+    let token = NEXT_FUNCTION_TOKEN.fetch_add(0x100, Ordering::SeqCst);
+    functions.insert(token, real);
+    token
+}
+
+static CHEAT_FUNCTION_COMPAT: Lazy<Box<[u32]>> = Lazy::new(|| {
+    let mut out = Vec::with_capacity(crate::jailed_cheats::CHEAT_COUNT);
+    for index in 0..crate::jailed_cheats::CHEAT_COUNT {
+        let real = crate::jailed_cheats::function_address(index);
+        out.push(register_function_token(real));
+    }
+    out.into_boxed_slice()
+});
+
+fn register_symbol_region(name: &str, real_base: usize, writable: bool, span: u32) -> u32 {
     let mut regions = SYMBOL_REGIONS.lock().unwrap();
 
     if let Some(existing) = regions.iter().find(|region| region.name == name) {
@@ -79,7 +111,7 @@ fn register_symbol_region(name: &str, real_base: usize, writable: bool) -> u32 {
     regions.push(AddressRegion {
         virtual_base,
         real_base,
-        span: SYMBOL_VIRTUAL_SPAN,
+        span: span.max(1),
         writable,
         name: name.to_string(),
     });
@@ -157,6 +189,7 @@ struct Script {
     enabled: bool,
     error: Option<String>,
     virtual_base: u32,
+    context: [u64; 32],
 }
 
 unsafe impl Send for Script {}
@@ -173,6 +206,7 @@ impl Script {
             enabled: kind == Kind::Csa,
             error: None,
             virtual_base: NEXT_SCRIPT_VBASE.fetch_add(SCRIPT_VIRTUAL_STRIDE, Ordering::SeqCst),
+            context: [0; 32],
         }
     }
 
@@ -180,6 +214,7 @@ impl Script {
         let base = self.bytes.as_ptr().cast::<u16>();
         self.game = GameScript::new(base, active);
         self.error = None;
+        self.context = [0; 32];
     }
 
     fn stop_with_error(&mut self, message: String) {
@@ -197,6 +232,12 @@ impl Script {
         let get_ptr: fn(*mut GameScript) -> T =
             unsafe { std::mem::transmute(absolute(GET_POINTER_TO_VARIABLE_ADDR)) };
         get_ptr(&mut self.game)
+    }
+
+    fn update_bool_flag(&mut self, value: bool) {
+        let update: fn(*mut GameScript, bool) =
+            unsafe { std::mem::transmute(absolute(UPDATE_COMPARE_FLAG_ADDR)) };
+        update(&mut self.game, value);
     }
 
     fn script_params() -> *const u32 {
@@ -247,9 +288,134 @@ impl Script {
         None
     }
 
-    fn android_symbol(&self, name: &str) -> Option<(usize, bool)> {
-        // First try normal dynamic lookup. A few C/runtime symbols are exported on
-        // iOS even though most GTA C++ symbols are stripped.
+    fn read_virtual_u8(&self, address: u32) -> Option<u8> {
+        let (ptr, _) = self.resolve_virtual_address(address, 1)?;
+        Some(unsafe { ptr.read() })
+    }
+
+    fn read_virtual_c_string_advance(&self, address: &mut u32) -> Option<String> {
+        let start = *address;
+        let value = self.read_virtual_c_string(start)?;
+        *address = address.wrapping_add(value.len() as u32 + 1);
+        Some(value)
+    }
+
+    fn resolve_callable(&self, address: u32) -> Option<usize> {
+        if let Some(real) = FUNCTION_TOKENS.lock().unwrap().get(&address).copied() {
+            return Some(real);
+        }
+
+        self.resolve_virtual_address(address, 1)
+            .map(|(ptr, _)| ptr as usize)
+    }
+
+    fn call_integer_function(&mut self, address: u32, args: &[u64]) -> Option<u64> {
+        let real = self.resolve_callable(address)?;
+
+        unsafe {
+            Some(match args.len() {
+                0 => {
+                    let f: extern "C" fn() -> u64 = std::mem::transmute(real);
+                    f()
+                }
+                1 => {
+                    let f: extern "C" fn(u64) -> u64 = std::mem::transmute(real);
+                    f(args[0])
+                }
+                2 => {
+                    let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(real);
+                    f(args[0], args[1])
+                }
+                3 => {
+                    let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(real);
+                    f(args[0], args[1], args[2])
+                }
+                4 => {
+                    let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(real);
+                    f(args[0], args[1], args[2], args[3])
+                }
+                5 => {
+                    let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 =
+                        std::mem::transmute(real);
+                    f(args[0], args[1], args[2], args[3], args[4])
+                }
+                6 => {
+                    let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                        std::mem::transmute(real);
+                    f(args[0], args[1], args[2], args[3], args[4], args[5])
+                }
+                7 => {
+                    let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                        std::mem::transmute(real);
+                    f(args[0], args[1], args[2], args[3], args[4], args[5], args[6])
+                }
+                8 => {
+                    let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                        std::mem::transmute(real);
+                    f(
+                        args[0], args[1], args[2], args[3],
+                        args[4], args[5], args[6], args[7],
+                    )
+                }
+                _ => return None,
+            })
+        }
+    }
+
+    fn read_8byte_string_param(&mut self) -> Option<Option<String>> {
+        unsafe {
+            let p = self.game.ip.cast::<u8>();
+            let tag = p.read();
+
+            if tag == 0 {
+                self.game.ip = p.add(1).cast::<u16>();
+                return Some(None);
+            }
+
+            if tag != 0x09 {
+                return None;
+            }
+
+            let bytes = std::slice::from_raw_parts(p.add(1), 8);
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            let value = String::from_utf8(bytes[..end].to_vec()).ok()?;
+            self.game.ip = p.add(9).cast::<u16>();
+            Some(Some(value))
+        }
+    }
+
+    fn translate_fxt(key: &str) -> String {
+        FXT_MAP
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| key.to_string())
+    }
+
+    fn android_symbol(&self, name: &str) -> Option<(usize, bool, u32)> {
+        // Compatibility adapters for common CLEO Android exports whose 32-bit
+        // layout differs from the 64-bit iOS game.
+        match name {
+            "_ZN6CCheat17m_aCheatFunctionsE" => {
+                return Some((
+                    CHEAT_FUNCTION_COMPAT.as_ptr() as usize,
+                    false,
+                    (CHEAT_FUNCTION_COMPAT.len() * std::mem::size_of::<u32>()) as u32,
+                ));
+            }
+            "_ZN6CCheat15m_aCheatsActiveE" => {
+                return Some((
+                    crate::jailed_cheats::absolute(crate::jailed_cheats::CHEAT_ACTIVE_FLAGS),
+                    true,
+                    crate::jailed_cheats::CHEAT_COUNT as u32,
+                ));
+            }
+            _ => {}
+        }
+
+        // Some symbols remain exported on iOS. Try dyld before consulting
+        // per-game compatibility adapters.
         let c_name = CString::new(name).ok()?;
         let ptr = unsafe {
             // Darwin RTLD_DEFAULT is ((void *)-2).
@@ -257,13 +423,12 @@ impl Script {
         };
 
         if !ptr.is_null() {
-            // Treat arbitrary dynamically found symbols as read-only until we have
-            // verified that a script is addressing writable game data.
-            return Some((ptr as usize, false));
+            return Some((ptr as usize, false, SYMBOL_VIRTUAL_SPAN));
         }
 
-        // GTA-specific stripped-symbol translations are added here as we verify
-        // their iOS 2.02.11 addresses/patterns.
+        // Stripped GTA globals such as gMobileMenu and CRadar::ms_RadarTrace
+        // require explicit iOS adapters because their 64-bit structure layouts
+        // are not binary-compatible with Android's 32-bit structures.
         None
     }
 
