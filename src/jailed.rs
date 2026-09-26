@@ -53,6 +53,7 @@ const TAG_TAB_CHEATS: i64 = 12;
 const TAG_TAB_OPTIONS: i64 = 13;
 const TAG_CSI_BASE: i64 = 1000;
 const TAG_CSA_BASE: i64 = 2000;
+const TAG_CHEAT_BASE: i64 = 3000;
 
 static GESTURE_TARGET: OnceCell<usize> = OnceCell::new();
 static OVERLAY: AtomicUsize = AtomicUsize::new(0);
@@ -198,6 +199,12 @@ fn add_action_row(
     }
 }
 
+fn set_scroll_height(parent: *mut Object, width: f64, height: f64) {
+    unsafe {
+        let _: () = msg_send![parent, setContentSize: CGSize { width, height }];
+    }
+}
+
 fn add_script_rows(parent: *mut Object, width: f64, extension: &str) {
     let is_csa = extension.eq_ignore_ascii_case("csa");
     let scripts = if is_csa {
@@ -223,8 +230,9 @@ fn add_script_rows(parent: *mut Object, width: f64, extension: &str) {
         .copied()
         .unwrap_or(0) as *mut Object;
 
+    let row_count = scripts.len();
     let mut y = 78.0;
-    for (index, script) in scripts.into_iter().take(12).enumerate() {
+    for (index, script) in scripts.into_iter().enumerate() {
         let (detail, value) = if let Some(error) = &script.error {
             (error.as_str(), "Error")
         } else if is_csa {
@@ -257,6 +265,57 @@ fn add_script_rows(parent: *mut Object, width: f64, extension: &str) {
         );
         y += 78.0;
     }
+
+    set_scroll_height(parent, width, (row_count as f64 * 78.0 + 90.0).max(620.0));
+}
+
+fn add_cheat_rows(parent: *mut Object, width: f64) {
+    let cheats = crate::jailed_cheats::statuses();
+
+    if cheats.is_empty() {
+        add_label(
+            parent,
+            CGRect::new(width * 0.06, 95.0, width * 0.88, 100.0),
+            "No named cheats found.",
+            17.0,
+            1,
+            0.72,
+        );
+        return;
+    }
+
+    let target = GESTURE_TARGET
+        .get()
+        .copied()
+        .unwrap_or(0) as *mut Object;
+
+    let row_count = cheats.len();
+    let mut y = 78.0;
+
+    for (index, cheat) in cheats.into_iter().enumerate() {
+        let value = if cheat.queued {
+            if cheat.will_be_active { "Queued On" } else { "Queued Off" }
+        } else if cheat.active {
+            "On"
+        } else {
+            "Off"
+        };
+
+        add_action_row(
+            parent,
+            target,
+            y,
+            width,
+            cheat.code,
+            "Built-in GTA:SA cheat - tap to queue",
+            value,
+            TAG_CHEAT_BASE + index as i64,
+        );
+
+        y += 78.0;
+    }
+
+    set_scroll_height(parent, width, (row_count as f64 * 78.0 + 90.0).max(620.0));
 }
 
 fn clear_content() {
@@ -290,6 +349,8 @@ fn render_selected_tab() {
     unsafe {
         let bounds: CGRect = msg_send![content, bounds];
         let width = bounds.size.width;
+        let _: () = msg_send![content, setContentOffset: CGPoint { x: 0.0, y: 0.0 } animated: false];
+        set_scroll_height(content, width, bounds.size.height);
 
         match SELECTED_TAB.load(Ordering::SeqCst) as i64 {
             TAG_TAB_CSI => {
@@ -323,22 +384,7 @@ fn render_selected_tab() {
                     0,
                     1.0,
                 );
-                add_row(
-                    content,
-                    78.0,
-                    width,
-                    "Built-in cheat runtime",
-                    "Next porting stage after menu validation",
-                    "Pending",
-                );
-                add_row(
-                    content,
-                    156.0,
-                    width,
-                    "Game-safe execution",
-                    "Will use a UIKit-driven tick instead of hlhook",
-                    "Pending",
-                );
+                add_cheat_rows(content, width);
             }
             _ => {
                 add_label(
@@ -411,9 +457,16 @@ extern "C" fn handle_menu_button(_this: &Object, _cmd: Sel, button: *mut Object)
             return;
         }
 
-        if (TAG_CSA_BASE..(TAG_CSA_BASE + 1000)).contains(&tag) {
+        if (TAG_CSA_BASE..TAG_CHEAT_BASE).contains(&tag) {
             let index = (tag - TAG_CSA_BASE) as usize;
             crate::jailed_runtime::toggle_csa(index);
+            render_selected_tab();
+            return;
+        }
+
+        if (TAG_CHEAT_BASE..(TAG_CHEAT_BASE + 1000)).contains(&tag) {
+            let index = (tag - TAG_CHEAT_BASE) as usize;
+            crate::jailed_cheats::toggle_queue(index);
             render_selected_tab();
         }
     }
@@ -583,9 +636,10 @@ fn show_menu() {
 
         let content_frame =
             CGRect::new(0.0, tab_h, bounds.size.width, bounds.size.height - tab_h - close_h);
-        let content: *mut Object = msg_send![class!(UIView), alloc];
+        let content: *mut Object = msg_send![class!(UIScrollView), alloc];
         let content: *mut Object = msg_send![content, initWithFrame: content_frame];
         set_bg(content, 0.0, 0.16);
+        let _: () = msg_send![content, setAlwaysBounceVertical: true];
         let _: () = msg_send![overlay, addSubview: content];
         CONTENT_VIEW.store(content as usize, Ordering::SeqCst);
         let _: () = msg_send![content, release];
@@ -641,6 +695,8 @@ fn hide_menu() {
         let _: () = msg_send![view, removeFromSuperview];
         let _: () = msg_send![view, release];
     }
+
+    crate::jailed_cheats::process_queue();
 }
 
 fn toggle_menu() {
