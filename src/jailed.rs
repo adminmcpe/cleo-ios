@@ -468,7 +468,15 @@ extern "C" fn handle_cleo_swipe(_this: &Object, _cmd: Sel, _gesture: *mut Object
         return;
     }
 
-    toggle_menu();
+    // The global swipe recognizer is also active while the CLEO UIScrollView is
+    // visible. Treat swipe-down as an *open-only* gesture so dragging the script
+    // list downward can never dismiss the menu. The dedicated Close button is
+    // the only way to close while the overlay is visible.
+    if OVERLAY.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+
+    show_menu();
 }
 
 extern "C" fn handle_cleo_touch(_this: &Object, _cmd: Sel, gesture: *mut Object) {
