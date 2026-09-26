@@ -10,10 +10,13 @@ use objc::{
     runtime::{self, Object, Sel},
     sel,
 };
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
 use std::{
     ffi::CString,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    },
 };
 
 #[repr(C)]
@@ -54,12 +57,35 @@ const TAG_TAB_OPTIONS: i64 = 13;
 const TAG_CSI_BASE: i64 = 1000;
 const TAG_CSA_BASE: i64 = 2000;
 const TAG_CHEAT_BASE: i64 = 3000;
+const TAG_ANDROID_ITEM_BASE: i64 = 10_000;
+const TAG_ANDROID_CLOSE: i64 = 19_999;
 
 static GESTURE_TARGET: OnceCell<usize> = OnceCell::new();
 static OVERLAY: AtomicUsize = AtomicUsize::new(0);
 static CONTENT_VIEW: AtomicUsize = AtomicUsize::new(0);
 static SELECTED_TAB: AtomicUsize = AtomicUsize::new(TAG_TAB_CSI as usize);
 static TIMER_INSTALLED: AtomicBool = AtomicBool::new(false);
+static ANDROID_MENU_OVERLAY: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+struct AndroidMenuState {
+    selected: i32,
+    selected_time_ms: u64,
+    active_item: i32,
+}
+
+impl Default for AndroidMenuState {
+    fn default() -> Self {
+        Self {
+            selected: -1,
+            selected_time_ms: 0,
+            active_item: 0,
+        }
+    }
+}
+
+static ANDROID_MENU_STATE: Lazy<Mutex<AndroidMenuState>> =
+    Lazy::new(|| Mutex::new(AndroidMenuState::default()));
 
 fn ns_string(value: &str) -> *const Object {
     unsafe {
@@ -425,7 +451,66 @@ fn render_selected_tab() {
 }
 
 extern "C" fn handle_cleo_swipe(_this: &Object, _cmd: Sel, _gesture: *mut Object) {
+    crate::jailed_touch::pulse_menu_button();
+
+    // Android CLEO scripts use a menu/back-button press as a cancel action.
+    // Do not open our own CLEO menu over a script-owned Android compatibility menu.
+    if ANDROID_MENU_OVERLAY.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+
     toggle_menu();
+}
+
+extern "C" fn handle_cleo_touch(_this: &Object, _cmd: Sel, gesture: *mut Object) {
+    // Ignore gameplay touch-zone reporting while either CLEO UI is covering the game.
+    if OVERLAY.load(Ordering::SeqCst) != 0
+        || ANDROID_MENU_OVERLAY.load(Ordering::SeqCst) != 0
+    {
+        return;
+    }
+
+    unsafe {
+        let state: i64 = msg_send![gesture, state];
+        let view: *mut Object = msg_send![gesture, view];
+        if view.is_null() {
+            return;
+        }
+
+        let point: CGPoint = msg_send![gesture, locationInView: view];
+        let bounds: CGRect = msg_send![view, bounds];
+
+        match state {
+            1 => crate::jailed_touch::touch_began(
+                point.x,
+                point.y,
+                bounds.size.width,
+                bounds.size.height,
+            ),
+            2 => crate::jailed_touch::touch_moved(
+                point.x,
+                point.y,
+                bounds.size.width,
+                bounds.size.height,
+            ),
+            3 | 4 | 5 => crate::jailed_touch::touch_ended(
+                point.x,
+                point.y,
+                bounds.size.width,
+                bounds.size.height,
+            ),
+            _ => {}
+        }
+    }
+}
+
+extern "C" fn allow_simultaneous_gestures(
+    _this: &Object,
+    _cmd: Sel,
+    _first: *mut Object,
+    _second: *mut Object,
+) -> runtime::BOOL {
+    runtime::YES
 }
 
 extern "C" fn runtime_timer_tick(_this: &Object, _cmd: Sel, _timer: *mut Object) {
@@ -468,6 +553,22 @@ extern "C" fn handle_menu_button(_this: &Object, _cmd: Sel, button: *mut Object)
             let index = (tag - TAG_CHEAT_BASE) as usize;
             crate::jailed_cheats::toggle_queue(index);
             render_selected_tab();
+            return;
+        }
+
+        if (TAG_ANDROID_ITEM_BASE..TAG_ANDROID_CLOSE).contains(&tag) {
+            let index = (tag - TAG_ANDROID_ITEM_BASE) as i32;
+            let mut state = ANDROID_MENU_STATE.lock().unwrap();
+            state.selected = index;
+            state.active_item = index;
+            state.selected_time_ms = crate::jailed_touch::now_ms();
+            return;
+        }
+
+        if tag == TAG_ANDROID_CLOSE {
+            let mut state = ANDROID_MENU_STATE.lock().unwrap();
+            state.selected = -2;
+            state.selected_time_ms = crate::jailed_touch::now_ms();
         }
     }
 }
@@ -483,6 +584,15 @@ fn target_class() -> &'static runtime::Class {
             decl.add_method(
                 sel!(handleCleoSwipe:),
                 handle_cleo_swipe as extern "C" fn(&Object, Sel, *mut Object),
+            );
+            decl.add_method(
+                sel!(handleCleoTouch:),
+                handle_cleo_touch as extern "C" fn(&Object, Sel, *mut Object),
+            );
+            decl.add_method(
+                sel!(gestureRecognizer:shouldRecognizeSimultaneouslyWithGestureRecognizer:),
+                allow_simultaneous_gestures
+                    as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> runtime::BOOL,
             );
             decl.add_method(
                 sel!(handleCleoMenuButton:),
@@ -515,8 +625,19 @@ fn install_swipe_gesture() {
 
         let _: () = msg_send![recognizer, setDirection: 8usize];
         let _: () = msg_send![recognizer, setCancelsTouchesInView: false];
+        let _: () = msg_send![recognizer, setDelegate: target];
         let _: () = msg_send![window, addGestureRecognizer: recognizer];
         let _: () = msg_send![recognizer, release];
+
+        let touch: *mut Object = msg_send![class!(UILongPressGestureRecognizer), alloc];
+        let touch: *mut Object =
+            msg_send![touch, initWithTarget: target action: sel!(handleCleoTouch:)];
+        let _: () = msg_send![touch, setMinimumPressDuration: 0.0f64];
+        let _: () = msg_send![touch, setAllowableMovement: 10000.0f64];
+        let _: () = msg_send![touch, setCancelsTouchesInView: false];
+        let _: () = msg_send![touch, setDelegate: target];
+        let _: () = msg_send![window, addGestureRecognizer: touch];
+        let _: () = msg_send![touch, release];
 
         let _ = GESTURE_TARGET.set(target as usize);
     }
@@ -572,6 +693,176 @@ fn add_tab_button(
         let _: () = msg_send![parent, addSubview: button];
         let _: () = msg_send![button, release];
     }
+}
+
+
+fn add_android_menu_button(
+    parent: *mut Object,
+    target: *mut Object,
+    frame: CGRect,
+    title: &str,
+    tag: i64,
+) {
+    unsafe {
+        let button: *mut Object = msg_send![class!(UIButton), alloc];
+        let button: *mut Object = msg_send![button, initWithFrame: frame];
+        let _: () = msg_send![button, setTitle: ns_string(title) forState: 0u64];
+        let _: () = msg_send![button, setTag: tag];
+        set_bg(button, 1.0, 0.10);
+
+        let label: *mut Object = msg_send![button, titleLabel];
+        let font: *mut Object = msg_send![class!(UIFont), systemFontOfSize: 17.0f64];
+        let _: () = msg_send![label, setFont: font];
+        let _: () = msg_send![label, setNumberOfLines: 1i64];
+
+        let _: () = msg_send![
+            button,
+            addTarget: target
+            action: sel!(handleCleoMenuButton:)
+            forControlEvents: 1u64 << 6
+        ];
+
+        let _: () = msg_send![parent, addSubview: button];
+        let _: () = msg_send![button, release];
+    }
+}
+
+pub fn show_android_menu(title: String, close_title: String, items: Vec<String>) {
+    hide_android_menu();
+
+    unsafe {
+        let app: *mut Object = msg_send![class!(UIApplication), sharedApplication];
+        let window: *mut Object = msg_send![app, keyWindow];
+        if window.is_null() {
+            return;
+        }
+
+        let bounds: CGRect = msg_send![window, bounds];
+        let target = GESTURE_TARGET
+            .get()
+            .copied()
+            .unwrap_or(0) as *mut Object;
+
+        if target.is_null() {
+            return;
+        }
+
+        let overlay: *mut Object = msg_send![class!(UIView), alloc];
+        let overlay: *mut Object = msg_send![overlay, initWithFrame: bounds];
+        set_bg(overlay, 0.0, 0.80);
+
+        add_label(
+            overlay,
+            CGRect::new(bounds.size.width * 0.05, 16.0, bounds.size.width * 0.90, 50.0),
+            &title,
+            27.0,
+            1,
+            1.0,
+        );
+
+        let close_h = 58.0;
+        let top = 72.0;
+        let scroll_h = bounds.size.height - top - close_h;
+
+        let scroll: *mut Object = msg_send![class!(UIScrollView), alloc];
+        let scroll: *mut Object =
+            msg_send![scroll, initWithFrame: CGRect::new(0.0, top, bounds.size.width, scroll_h)];
+        let _: () = msg_send![scroll, setAlwaysBounceVertical: true];
+
+        let mut y = 6.0;
+        for (index, item) in items.iter().enumerate() {
+            add_android_menu_button(
+                scroll,
+                target,
+                CGRect::new(bounds.size.width * 0.06, y, bounds.size.width * 0.88, 54.0),
+                item,
+                TAG_ANDROID_ITEM_BASE + index as i64,
+            );
+            y += 60.0;
+        }
+
+        let _: () = msg_send![
+            scroll,
+            setContentSize: CGSize {
+                width: bounds.size.width,
+                height: y.max(scroll_h),
+            }
+        ];
+        let _: () = msg_send![overlay, addSubview: scroll];
+        let _: () = msg_send![scroll, release];
+
+        let close: *mut Object = msg_send![class!(UIButton), alloc];
+        let close: *mut Object = msg_send![
+            close,
+            initWithFrame: CGRect::new(
+                0.0,
+                bounds.size.height - close_h,
+                bounds.size.width,
+                close_h,
+            )
+        ];
+        let _: () = msg_send![close, setTitle: ns_string(&close_title) forState: 0u64];
+        let _: () = msg_send![close, setTag: TAG_ANDROID_CLOSE];
+        let red: *mut Object =
+            msg_send![class!(UIColor), colorWithRed: 1.0f64 green: 0.20f64 blue: 0.25f64 alpha: 0.36f64];
+        let _: () = msg_send![close, setBackgroundColor: red];
+        let _: () = msg_send![
+            close,
+            addTarget: target
+            action: sel!(handleCleoMenuButton:)
+            forControlEvents: 1u64 << 6
+        ];
+        let _: () = msg_send![overlay, addSubview: close];
+        let _: () = msg_send![close, release];
+
+        let _: () = msg_send![window, addSubview: overlay];
+        ANDROID_MENU_OVERLAY.store(overlay as usize, Ordering::SeqCst);
+
+        let mut state = ANDROID_MENU_STATE.lock().unwrap();
+        state.selected = -1;
+        state.selected_time_ms = 0;
+        if state.active_item < 0 || state.active_item as usize >= items.len() {
+            state.active_item = 0;
+        }
+    }
+}
+
+pub fn hide_android_menu() {
+    let current = ANDROID_MENU_OVERLAY.swap(0, Ordering::SeqCst);
+    if current == 0 {
+        return;
+    }
+
+    unsafe {
+        let view = current as *mut Object;
+        let _: () = msg_send![view, removeFromSuperview];
+        let _: () = msg_send![view, release];
+    }
+}
+
+pub fn android_menu_take_selected(max_time_ms: u32) -> i32 {
+    let now = crate::jailed_touch::now_ms();
+    let mut state = ANDROID_MENU_STATE.lock().unwrap();
+
+    if state.selected_time_ms != 0
+        && now <= state.selected_time_ms.saturating_add(max_time_ms as u64)
+    {
+        let selected = state.selected;
+        state.selected_time_ms = 0;
+        selected
+    } else {
+        -1
+    }
+}
+
+pub fn android_menu_set_active(index: i32) {
+    if index >= 0 {
+        ANDROID_MENU_STATE.lock().unwrap().active_item = index;
+    }
+}
+
+pub fn android_menu_get_active() -> i32 {
+    ANDROID_MENU_STATE.lock().unwrap().active_item
 }
 
 fn show_menu() {
