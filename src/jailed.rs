@@ -1,30 +1,67 @@
-//! Jailed/sideload proof-of-concept UI path.
+//! Minimal jailbreak-free proof of concept.
 //!
-//! This module intentionally avoids CLEO's low-level game hooks.  It only uses
-//! Objective-C/UIKit APIs so we can verify that a sideloaded build can stay
-//! alive and receive a swipe gesture before reintroducing game integration.
+//! No game code is patched here. The only hook is Objective-C method swizzling,
+//! which already proved functional in the user's CLEO 2.6.0 log.
 
-use crate::meta::gui::{ns_string, CGRect};
 use objc::{
     class,
     declare::ClassDecl,
     msg_send,
-    runtime::{Object, Sel},
+    runtime::{self, Object, Sel},
     sel,
 };
 use once_cell::sync::OnceCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    ffi::CString,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+impl CGRect {
+    fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
+        Self {
+            origin: CGPoint { x, y },
+            size: CGSize { width, height },
+        }
+    }
+}
 
 static GESTURE_TARGET: OnceCell<usize> = OnceCell::new();
 static OVERLAY: AtomicUsize = AtomicUsize::new(0);
 
-extern fn handle_cleo_swipe(_this: &Object, _cmd: Sel, _gesture: *mut Object) {
-    log::info!("jailed swipe gesture received");
+fn ns_string(value: &str) -> *const Object {
+    unsafe {
+        let value = CString::new(value).unwrap();
+        msg_send![class!(NSString), stringWithUTF8String: value.as_ptr()]
+    }
+}
+
+extern "C" fn handle_cleo_swipe(_this: &Object, _cmd: Sel, _gesture: *mut Object) {
     toggle_test_menu();
 }
 
-fn gesture_target_class() -> &'static objc::runtime::Class {
-    static CLASS: OnceCell<&'static objc::runtime::Class> = OnceCell::new();
+fn gesture_target_class() -> &'static runtime::Class {
+    static CLASS: OnceCell<&'static runtime::Class> = OnceCell::new();
 
     CLASS.get_or_init(|| {
         let mut decl =
@@ -33,7 +70,7 @@ fn gesture_target_class() -> &'static objc::runtime::Class {
         unsafe {
             decl.add_method(
                 sel!(handleCleoSwipe:),
-                handle_cleo_swipe as extern fn(&Object, Sel, *mut Object),
+                handle_cleo_swipe as extern "C" fn(&Object, Sel, *mut Object),
             );
         }
 
@@ -41,19 +78,12 @@ fn gesture_target_class() -> &'static objc::runtime::Class {
     })
 }
 
-pub fn install_swipe_gesture(_source_view: *mut Object) {
-    // LegalSplash's view is short-lived, so attach the recognizer to UIWindow.
+fn install_swipe_gesture() {
     unsafe {
         let app: *mut Object = msg_send![class!(UIApplication), sharedApplication];
         let window: *mut Object = msg_send![app, keyWindow];
 
-        if window.is_null() {
-            log::error!("jailed gesture install failed: keyWindow is null");
-            return;
-        }
-
-        if GESTURE_TARGET.get().is_some() {
-            log::debug!("jailed swipe gesture already installed");
+        if window.is_null() || GESTURE_TARGET.get().is_some() {
             return;
         }
 
@@ -64,16 +94,13 @@ pub fn install_swipe_gesture(_source_view: *mut Object) {
         let recognizer: *mut Object =
             msg_send![recognizer, initWithTarget: target action: sel!(handleCleoSwipe:)];
 
-        // UISwipeGestureRecognizerDirectionDown == 1 << 3.
+        // UISwipeGestureRecognizerDirectionDown.
         let _: () = msg_send![recognizer, setDirection: 8usize];
         let _: () = msg_send![recognizer, setCancelsTouchesInView: false];
         let _: () = msg_send![window, addGestureRecognizer: recognizer];
-
-        // UIWindow retains the recognizer; the recognizer retains its target.
         let _: () = msg_send![recognizer, release];
 
         let _ = GESTURE_TARGET.set(target as usize);
-        log::info!("jailed one-finger swipe-down recognizer installed on keyWindow");
     }
 }
 
@@ -86,7 +113,6 @@ fn toggle_test_menu() {
             let _: () = msg_send![view, removeFromSuperview];
             let _: () = msg_send![view, release];
             OVERLAY.store(0, Ordering::SeqCst);
-            log::info!("jailed test menu hidden");
             return;
         }
 
@@ -94,7 +120,6 @@ fn toggle_test_menu() {
         let window: *mut Object = msg_send![app, keyWindow];
 
         if window.is_null() {
-            log::error!("cannot show jailed test menu: keyWindow is null");
             return;
         }
 
@@ -107,7 +132,7 @@ fn toggle_test_menu() {
             msg_send![class!(UIColor), colorWithWhite: 0.0f64 alpha: 0.82f64];
         let _: () = msg_send![overlay, setBackgroundColor: background];
 
-        let label_frame = CGRect::new(
+        let frame = CGRect::new(
             bounds.size.width * 0.08,
             bounds.size.height * 0.28,
             bounds.size.width * 0.84,
@@ -115,10 +140,10 @@ fn toggle_test_menu() {
         );
 
         let label: *mut Object = msg_send![class!(UILabel), alloc];
-        let label: *mut Object = msg_send![label, initWithFrame: label_frame];
+        let label: *mut Object = msg_send![label, initWithFrame: frame];
         let _: () = msg_send![
             label,
-            setText: ns_string("CLEO Jailed Menu\n\nGesture works without low-level hooks.\nSwipe down again to close.")
+            setText: ns_string("CLEO Jailed Menu\n\nSwipe gesture works.\nSwipe down again to close.")
         ];
         let _: () = msg_send![label, setNumberOfLines: 0i64];
         let _: () = msg_send![label, setTextAlignment: 1i64];
@@ -131,14 +156,59 @@ fn toggle_test_menu() {
 
         let _: () = msg_send![overlay, addSubview: label];
         let _: () = msg_send![label, release];
-
         let _: () = msg_send![window, addSubview: overlay];
 
         OVERLAY.store(overlay as usize, Ordering::SeqCst);
-        log::info!("jailed test menu shown");
+    }
+}
+
+extern "C" fn legal_splash_did_load(this: &mut Object, _cmd: Sel) {
+    unsafe {
+        // Call the original implementation after method exchange.
+        let _: () = msg_send![this, cleoJailedOriginalViewDidLoad];
+    }
+
+    install_swipe_gesture();
+}
+
+fn hook_legal_splash() {
+    unsafe {
+        let class_name = CString::new("LegalSplash").unwrap();
+        let class = runtime::objc_getClass(class_name.as_ptr());
+
+        if class.is_null() {
+            return;
+        }
+
+        let target_sel = sel!(viewDidLoad);
+        let original_sel = sel!(cleoJailedOriginalViewDidLoad);
+
+        let target_method = runtime::class_getInstanceMethod(class, target_sel);
+        if target_method.is_null() {
+            return;
+        }
+
+        let type_encoding = runtime::method_getTypeEncoding(target_method);
+
+        let added = runtime::class_addMethod(
+            class as *mut runtime::Class,
+            original_sel,
+            std::mem::transmute(legal_splash_did_load as extern "C" fn(&mut Object, Sel)),
+            type_encoding,
+        );
+
+        if added == runtime::NO {
+            return;
+        }
+
+        let replacement_method = runtime::class_getInstanceMethod(class, original_sel);
+        runtime::method_exchangeImplementations(
+            target_method as *mut runtime::Method,
+            replacement_method as *mut runtime::Method,
+        );
     }
 }
 
 pub fn init() {
-    log::info!("jailed UIKit-only mode initialised; waiting for LegalSplash to install gesture");
+    hook_legal_splash();
 }
