@@ -24,13 +24,17 @@ const COLLECT_PARAMETERS_ADDR: usize = 0x1001cf474;
 const GET_POINTER_TO_VARIABLE_ADDR: usize = 0x1001cfb04;
 const SCRIPT_PARAMS_ADDR: usize = 0x1007ad690;
 const UPDATE_COMPARE_FLAG_ADDR: usize = 0x1001df890;
+// Original CLEO iOS 2.6 writes this game variable from CTimer::GetCyclesPerMillisecond
+// to enforce the selected frame cap. The jailed build cannot install that hook, so
+// compatible 60 FPS scripts re-apply the same value from our main-thread runtime tick.
+const FPS_CAP_ADDR: usize = 0x1008f07b8;
 
 const ANDROID_IMAGE_VBASE: u32 = 0xB000_0000;
 
 const MAX_INSTRUCTIONS_PER_TICK: usize = 512;
 const SCRIPT_VIRTUAL_STRIDE: u32 = 0x0010_0000;
 const SYMBOL_VIRTUAL_STRIDE: u32 = 0x0010_0000;
-const SYMBOL_VIRTUAL_SPAN: u32 = 0x0010_0000;
+const SYMBOL_VIRTUAL_SPAN: u32 = 0x0000_1000;
 
 const LC_SEGMENT_64: u32 = 0x19;
 const VM_PROT_WRITE: i32 = 0x2;
@@ -317,11 +321,11 @@ fn find_macho_symbol(name: &str) -> Option<usize> {
     None
 }
 
-fn is_executable_address(address: usize) -> bool {
+fn segment_info(address: usize) -> Option<(usize, bool, bool)> {
     unsafe {
         let header = _dyld_get_image_header(0);
         if header.is_null() {
-            return false;
+            return None;
         }
 
         let slide = _dyld_get_image_vmaddr_slide(0);
@@ -331,7 +335,7 @@ fn is_executable_address(address: usize) -> bool {
         for _ in 0..(*header).ncmds {
             let load = &*(command as *const LoadCommand);
             if load.cmdsize < std::mem::size_of::<LoadCommand>() as u32 {
-                return false;
+                return None;
             }
 
             if load.cmd == LC_SEGMENT_64
@@ -341,11 +345,12 @@ fn is_executable_address(address: usize) -> bool {
                 let start = (segment.vmaddr as isize + slide) as usize;
                 let end = start.saturating_add(segment.vmsize as usize);
 
-                if address >= start
-                    && address < end
-                    && (segment.initprot & VM_PROT_EXECUTE) != 0
-                {
-                    return true;
+                if address >= start && address < end {
+                    return Some((
+                        end.saturating_sub(address),
+                        (segment.initprot & VM_PROT_WRITE) != 0,
+                        (segment.initprot & VM_PROT_EXECUTE) != 0,
+                    ));
                 }
             }
 
@@ -353,7 +358,21 @@ fn is_executable_address(address: usize) -> bool {
         }
     }
 
-    false
+    None
+}
+
+fn is_executable_address(address: usize) -> bool {
+    segment_info(address)
+        .map(|(_, _, executable)| executable)
+        .unwrap_or(false)
+}
+
+fn is_local_compat_callable(address: usize) -> bool {
+    address == jailed_toggle_player_invincibility as usize
+}
+
+fn is_safe_callable(address: usize) -> bool {
+    is_local_compat_callable(address) || is_executable_address(address)
 }
 
 fn find_native_game_symbol(name: &str) -> Option<usize> {
@@ -395,13 +414,13 @@ static INVINCIBILITY_COMPAT: Lazy<Mutex<Box<u8>>> =
     Lazy::new(|| Mutex::new(Box::new(0)));
 
 extern "C" fn jailed_toggle_player_invincibility() {
-    let current = crate::jailed_cheats::active(69);
-    crate::jailed_cheats::set_active(69, !current);
+    let current = crate::jailed_cheats::active(7);
+    crate::jailed_cheats::run_index(7);
     *INVINCIBILITY_COMPAT.lock().unwrap() = if !current { 1 } else { 0 };
 }
 
 fn invincibility_value_ptr() -> usize {
-    let active = crate::jailed_cheats::active(69);
+    let active = crate::jailed_cheats::active(7);
     let mut value = INVINCIBILITY_COMPAT.lock().unwrap();
     *value = if active { 1 } else { 0 };
     (&mut **value) as *mut u8 as usize
@@ -814,6 +833,23 @@ enum Kind {
     Csa,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpecialScript {
+    None,
+    Fps60,
+}
+
+impl SpecialScript {
+    fn from_name(name: &str) -> Self {
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("60fps") && lower.ends_with(".csa") {
+            Self::Fps60
+        } else {
+            Self::None
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Script {
     kind: Kind,
@@ -824,6 +860,7 @@ struct Script {
     error: Option<String>,
     virtual_base: u32,
     context: [u64; 32],
+    special: SpecialScript,
 }
 
 unsafe impl Send for Script {}
@@ -847,6 +884,7 @@ impl Script {
             error: None,
             virtual_base: NEXT_SCRIPT_VBASE.fetch_add(SCRIPT_VIRTUAL_STRIDE, Ordering::SeqCst),
             context: [0; 32],
+            special: SpecialScript::from_name(&name),
         }
     }
 
@@ -942,16 +980,15 @@ impl Script {
     }
 
     fn resolve_callable(&self, address: u32) -> Option<usize> {
-        let real = if let Some(real) = FUNCTION_TOKENS.lock().unwrap().get(&address).copied() {
-            real
-        } else {
-            self.resolve_virtual_address(address, 1)?.0 as usize
-        };
+        if let Some(real) = FUNCTION_TOKENS.lock().unwrap().get(&address).copied() {
+            return is_safe_callable(real).then_some(real);
+        }
+
+        let real = self.resolve_virtual_address(address, 1)?.0 as usize;
 
         // Never execute script bytes or writable/data mappings as code.
         // Android 0DD2/0DDE scripts frequently manipulate pointers; treating an
-        // arbitrary virtual address as a callable function is an immediate crash
-        // on iOS. Only an address inside an executable Mach-O segment is callable.
+        // arbitrary virtual address as a callable function is an immediate crash.
         is_executable_address(real).then_some(real)
     }
 
@@ -1073,6 +1110,14 @@ impl Script {
     }
 
     fn read_8byte_string_param(&mut self) -> Option<Option<String>> {
+        let base = self.game.base_ip as usize;
+        let current = self.game.ip as usize;
+        let offset = current.checked_sub(base)?;
+
+        if offset >= self.bytes.len() {
+            return None;
+        }
+
         unsafe {
             let p = self.game.ip.cast::<u8>();
             let tag = p.read();
@@ -1082,7 +1127,7 @@ impl Script {
                 return Some(None);
             }
 
-            if tag != 0x09 {
+            if tag != 0x09 || offset.saturating_add(9) > self.bytes.len() {
                 return None;
             }
 
@@ -1152,7 +1197,11 @@ impl Script {
         // 32-bit structure layout. Start with exported symbols, then use Mach-O's
         // local nlist table when the App Store binary kept the symbol locally.
         let ptr = find_native_game_symbol(name)?;
-        Some((ptr, false, SYMBOL_VIRTUAL_SPAN))
+        let span = segment_info(ptr)
+            .map(|(remaining, _, _)| remaining.min(SYMBOL_VIRTUAL_SPAN as usize) as u32)
+            .unwrap_or(1)
+            .max(1);
+        Some((ptr, false, span))
     }
 
     fn update_android_opcode(&mut self, opcode: u16) -> Option<bool> {
@@ -1231,7 +1280,12 @@ impl Script {
                     return Some(true);
                 };
 
-                let token = register_symbol_region(&name, real, writable, span);
+                let token = if is_safe_callable(real) {
+                    register_function_token(real)
+                } else {
+                    register_symbol_region(&name, real, writable, span)
+                };
+
                 unsafe {
                     destination.write(token);
                 }
@@ -1750,8 +1804,12 @@ impl Script {
     }
 
     fn update_one(&mut self) -> bool {
-        let offset = self.game.ip as usize - self.game.base_ip as usize;
-        if offset + 2 > self.bytes.len() {
+        let Some(offset) = (self.game.ip as usize).checked_sub(self.game.base_ip as usize) else {
+            self.stop_with_error("Script instruction pointer moved before start of file".to_string());
+            return true;
+        };
+
+        if offset.saturating_add(2) > self.bytes.len() {
             self.stop_with_error("Script instruction pointer moved past end of file".to_string());
             return true;
         }
@@ -1773,6 +1831,17 @@ impl Script {
 
         if let Some(can_interrupt) = self.update_android_opcode(opcode) {
             return can_interrupt;
+        }
+
+        // Never pass an unknown CLEO-Android opcode into GTA's generic mobile
+        // extended-opcode handler. The numeric range belongs to CLEO Android;
+        // forwarding an unsupported one can jump through unrelated handler logic
+        // and is a common source of hard crashes. Quarantine the script instead.
+        if (0x0dd0..=0x0dff).contains(&opcode) {
+            self.stop_with_error(format!(
+                "Unsupported Android CLEO opcode {opcode:#06x}; script quarantined"
+            ));
+            return true;
         }
 
         // iOS CLEO touch-zone opcode. The second parameter is the CLEO zone.
@@ -1799,12 +1868,26 @@ impl Script {
             return true;
         }
 
+        if !is_executable_address(handler_addr) {
+            self.stop_with_error(format!(
+                "Unsafe handler address {handler_addr:#x} for opcode {opcode:#06x}; script quarantined"
+            ));
+            return true;
+        }
+
         let handler: Handler = unsafe { std::mem::transmute(handler_addr) };
         handler(&mut self.game, opcode) != 0
     }
 
     fn update(&mut self) {
         if !self.game.active {
+            return;
+        }
+
+        if self.special == SpecialScript::Fps60 {
+            unsafe {
+                (absolute(FPS_CAP_ADDR) as *mut u32).write(60);
+            }
             return;
         }
 
@@ -1979,6 +2062,9 @@ fn begin_game_session() {
 
 fn end_game_session() {
     *WAYPOINT_SCAN_CACHE.lock().unwrap() = (u32::MAX, None);
+    unsafe {
+        (absolute(FPS_CAP_ADDR) as *mut u32).write(30);
+    }
     let mut scripts = SCRIPTS.lock().unwrap();
     for script in scripts.iter_mut() {
         script.game.active = false;
@@ -2096,8 +2182,18 @@ pub fn toggle_csa(index: usize) -> bool {
 
     if script.enabled && in_game {
         script.reset(true);
+        if script.special == SpecialScript::Fps60 {
+            unsafe {
+                (absolute(FPS_CAP_ADDR) as *mut u32).write(60);
+            }
+        }
     } else if !script.enabled {
         script.game.active = false;
+        if script.special == SpecialScript::Fps60 {
+            unsafe {
+                (absolute(FPS_CAP_ADDR) as *mut u32).write(30);
+            }
+        }
     }
 
     true
