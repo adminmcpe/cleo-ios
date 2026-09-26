@@ -881,7 +881,10 @@ impl Script {
             bytes,
             game: GameScript::new(ip, false),
             name,
-            enabled: kind == Kind::Csa,
+            // Safe-start on jailed iOS: do not auto-run newly discovered CSA files.
+            // Android CSA mods can execute native code/memory operations immediately when
+            // gameplay begins. They remain listed in the CSA tab and can be enabled manually.
+            enabled: false,
             error: None,
             virtual_base: NEXT_SCRIPT_VBASE.fetch_add(SCRIPT_VIRTUAL_STRIDE, Ordering::SeqCst),
             context: [0; 32],
@@ -1964,6 +1967,9 @@ static SCRIPTS: Lazy<Mutex<Vec<Script>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static IN_GAME: AtomicBool = AtomicBool::new(false);
 static INITIALISED: AtomicBool = AtomicBool::new(false);
 static CSI_COUNT: AtomicU32 = AtomicU32::new(0);
+static CSA_AUTOSTART_DONE: AtomicBool = AtomicBool::new(false);
+static CSA_START_AFTER: AtomicU32 = AtomicU32::new(0);
+const CSA_STARTUP_DELAY_MS: u32 = 2000;
 
 fn cleo_dir() -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -2102,20 +2108,30 @@ pub fn reload_scripts() {
 
 fn begin_game_session() {
     *WAYPOINT_SCAN_CACHE.lock().unwrap() = (u32::MAX, None);
+    CSA_AUTOSTART_DONE.store(false, Ordering::SeqCst);
+
+    let now = unsafe { read_global::<u32>(GAME_TIME_ADDR) };
+    CSA_START_AFTER.store(now.saturating_add(CSA_STARTUP_DELAY_MS), Ordering::SeqCst);
+
     let mut scripts = SCRIPTS.lock().unwrap();
 
+    // Never run any script on the exact frame GTA enters gameplay.
+    // CSI stays idle until tapped; CSA that the user explicitly enabled is
+    // started after a short delay once the world/player state has settled.
     for script in scripts.iter_mut() {
-        match script.kind {
-            Kind::Csi => script.reset(false),
-            Kind::Csa => script.reset(script.enabled),
-        }
+        script.reset(false);
     }
 }
 
 fn end_game_session() {
     *WAYPOINT_SCAN_CACHE.lock().unwrap() = (u32::MAX, None);
+    CSA_AUTOSTART_DONE.store(false, Ordering::SeqCst);
+    CSA_START_AFTER.store(0, Ordering::SeqCst);
     unsafe {
-        (absolute(FPS_CAP_ADDR) as *mut u32).write(30);
+        let cap = absolute(FPS_CAP_ADDR);
+        if segment_info(cap).map(|(_, writable, _)| writable).unwrap_or(false) {
+            (cap as *mut u32).write(30);
+        }
     }
     let mut scripts = SCRIPTS.lock().unwrap();
     for script in scripts.iter_mut() {
@@ -2151,6 +2167,24 @@ pub fn tick() {
     crate::jailed_cheats::process_queue();
 
     let mut scripts = SCRIPTS.lock().unwrap();
+
+    if !CSA_AUTOSTART_DONE.load(Ordering::SeqCst) {
+        let game_time = unsafe { read_global::<u32>(GAME_TIME_ADDR) };
+        let start_after = CSA_START_AFTER.load(Ordering::SeqCst);
+
+        if start_after != 0 && game_time >= start_after {
+            for script in scripts
+                .iter_mut()
+                .filter(|s| s.kind == Kind::Csa && s.enabled)
+            {
+                if !script.game.active {
+                    script.reset(true);
+                }
+            }
+
+            CSA_AUTOSTART_DONE.store(true, Ordering::SeqCst);
+        }
+    }
 
     for script in scripts.iter_mut() {
         if script.kind == Kind::Csa && !script.enabled {
