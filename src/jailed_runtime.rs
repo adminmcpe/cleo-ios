@@ -586,6 +586,40 @@ fn target_blip_coords_from_game() -> Option<(f32, f32, f32)> {
     coords
 }
 
+fn native_ground_z_at(x: f32, y: f32) -> Option<f32> {
+    // Standard GTA SCM opcode 02CE is native to the game, unlike CLEO opcode
+    // 0AB6. Use the game's own command handler to obtain terrain height.
+    let mut params = [0u8; 18];
+    let mut at = 0usize;
+
+    for value in [x, y, 2000.0f32] {
+        params[at] = 0x06; // immediate real
+        params[at + 1..at + 5].copy_from_slice(&value.to_bits().to_le_bytes());
+        at += 5;
+    }
+
+    params[at] = 0x03; // local variable
+    params[at + 1..at + 3].copy_from_slice(&0u16.to_le_bytes());
+
+    let mut script = GameScript::new(params.as_ptr().cast::<u16>(), true);
+    let opcode = 0x02ceu16;
+    let handler_index = (opcode / 100) as usize;
+    let handler_offset = handler_index * 2;
+    let table = absolute(COMMAND_TABLE_ADDR) as *const usize;
+    let handler_addr = unsafe { table.add(handler_offset).read() };
+
+    if handler_addr == 0 {
+        return None;
+    }
+
+    type Handler = fn(*mut GameScript, u16) -> u8;
+    let handler: Handler = unsafe { std::mem::transmute(handler_addr) };
+    let _ = handler(&mut script, opcode);
+
+    let z = f32::from_bits(script.locals[0]);
+    z.is_finite().then_some(z)
+}
+
 fn refresh_marker_compat() {
     let mut mobile = MOBILE_MENU_COMPAT.lock().unwrap();
     let mut radar = RADAR_TRACE_COMPAT.lock().unwrap();
@@ -1067,7 +1101,8 @@ impl Script {
                 let out_y = self.read_variable_arg::<*mut u32>();
                 let out_z = self.read_variable_arg::<*mut u32>();
 
-                if let Some((x, y, z)) = target_blip_coords_from_game() {
+                if let Some((x, y, radar_z)) = target_blip_coords_from_game() {
+                    let z = native_ground_z_at(x, y).unwrap_or(radar_z);
                     unsafe {
                         out_x.write(x.to_bits());
                         out_y.write(y.to_bits());
