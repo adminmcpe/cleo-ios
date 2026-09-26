@@ -27,6 +27,8 @@ mod jailed;
 mod jailed_runtime;
 #[cfg(feature = "jailed")]
 mod jailed_cheats;
+#[cfg(feature = "jailed")]
+mod jailed_touch;
 
 #[cfg(not(feature = "jailed"))]
 mod targets {
