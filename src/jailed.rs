@@ -987,7 +987,6 @@ fn hide_menu() {
         let _: () = msg_send![view, release];
     }
 
-    crate::jailed_cheats::process_queue();
 }
 
 fn toggle_menu() {
