@@ -366,6 +366,8 @@ static RADAR_TRACE_COMPAT: Lazy<Mutex<Box<[u8]>>> = Lazy::new(|| {
         vec![0u8; RADAR_TRACE_COUNT * RADAR_TRACE_ANDROID_STRIDE].into_boxed_slice()
     )
 });
+static WAYPOINT_SCAN_CACHE: Lazy<Mutex<(u32, Option<(f32, f32, f32)>)>> =
+    Lazy::new(|| Mutex::new((u32::MAX, None)));
 
 #[derive(Clone, Copy)]
 struct RadarLayout {
@@ -569,7 +571,19 @@ fn target_blip_coords_from_game() -> Option<(f32, f32, f32)> {
     // caused teleport.csi to keep sending the player to the same place.
     //
     // Instead, locate the live waypoint record in GTA's writable radar pool.
-    scan_waypoint_from_game_data()
+    // Cache only within the exact same game tick: this avoids scanning the data
+    // segments four times while one teleport script reads index/X/Y/icon, but
+    // never reuses a waypoint from a previous frame after the user moves/removes it.
+    let game_time = unsafe { read_global::<u32>(GAME_TIME_ADDR) };
+    let mut cache = WAYPOINT_SCAN_CACHE.lock().unwrap();
+
+    if cache.0 == game_time {
+        return cache.1;
+    }
+
+    let coords = scan_waypoint_from_game_data();
+    *cache = (game_time, coords);
+    coords
 }
 
 fn refresh_marker_compat() {
