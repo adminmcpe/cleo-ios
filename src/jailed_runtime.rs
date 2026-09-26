@@ -96,6 +96,48 @@ extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(r#"
+    .text
+    .p2align 2
+    .globl _cleo_android_call_arm64
+_cleo_android_call_arm64:
+    stp x19, x20, [sp, #-16]!
+    mov x9, x0
+    mov x10, x1
+    mov x11, x2
+    mov x19, x3
+    mov x20, x4
+
+    ldp x0, x1, [x10, #0]
+    ldp x2, x3, [x10, #16]
+    ldp x4, x5, [x10, #32]
+    ldp x6, x7, [x10, #48]
+
+    ldp d0, d1, [x11, #0]
+    ldp d2, d3, [x11, #16]
+    ldp d4, d5, [x11, #32]
+    ldp d6, d7, [x11, #48]
+
+    blr x9
+
+    str x0, [x19]
+    str d0, [x20]
+    ldp x19, x20, [sp], #16
+    ret
+"#);
+
+#[cfg(target_arch = "aarch64")]
+extern "C" {
+    fn cleo_android_call_arm64(
+        target: usize,
+        integer_regs: *const u64,
+        float_regs: *const u64,
+        result_x0: *mut u64,
+        result_d0: *mut u64,
+    );
+}
+
 fn game_slide() -> usize {
     static SLIDE: Lazy<usize> = Lazy::new(|| unsafe {
         // CLEO 2.6.0 used the smaller slide of image 0 / image 1 because the
@@ -503,6 +545,12 @@ struct Script {
 
 unsafe impl Send for Script {}
 
+#[derive(Debug, Clone, Copy)]
+enum NativeArg {
+    Integer(u64),
+    Float(u32),
+}
+
 impl Script {
     fn new(kind: Kind, bytes: Vec<u8>, name: String) -> Self {
         let ip = bytes.as_ptr().cast::<u16>();
@@ -669,6 +717,70 @@ impl Script {
                 }
                 _ => return None,
             })
+        }
+    }
+
+    fn call_mixed_function(
+        &mut self,
+        address: u32,
+        args: &[NativeArg],
+    ) -> Option<(u64, u32)> {
+        let real = self.resolve_callable(address)?;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut integer_regs = [0u64; 8];
+            let mut float_regs = [0u64; 8];
+            let mut integer_count = 0usize;
+            let mut float_count = 0usize;
+
+            for arg in args {
+                match *arg {
+                    NativeArg::Integer(value) => {
+                        if integer_count >= integer_regs.len() {
+                            return None;
+                        }
+                        integer_regs[integer_count] = value;
+                        integer_count += 1;
+                    }
+                    NativeArg::Float(bits) => {
+                        if float_count >= float_regs.len() {
+                            return None;
+                        }
+                        // AArch64 passes a 32-bit float in the low half of Vn.
+                        float_regs[float_count] = bits as u64;
+                        float_count += 1;
+                    }
+                }
+            }
+
+            let mut result_x0 = 0u64;
+            let mut result_d0 = 0u64;
+
+            unsafe {
+                cleo_android_call_arm64(
+                    real,
+                    integer_regs.as_ptr(),
+                    float_regs.as_ptr(),
+                    &mut result_x0,
+                    &mut result_d0,
+                );
+            }
+
+            return Some((result_x0, result_d0 as u32));
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let integer_args: Option<Vec<u64>> = args
+                .iter()
+                .map(|arg| match arg {
+                    NativeArg::Integer(value) => Some(*value),
+                    NativeArg::Float(_) => None,
+                })
+                .collect();
+
+            self.call_integer_function(address, &integer_args?).map(|value| (value, 0))
         }
     }
 
@@ -1049,8 +1161,9 @@ impl Script {
                     return Some(true);
                 }
 
-                let mut args: Vec<u64> = Vec::new();
-                let mut result_ptr: Option<*mut u32> = None;
+                let mut args: Vec<NativeArg> = Vec::new();
+                let mut integer_result_ptr: Option<*mut u32> = None;
+                let mut float_result_ptr: Option<*mut u32> = None;
 
                 loop {
                     let Some(kind) = self.read_8byte_string_param() else {
@@ -1067,20 +1180,25 @@ impl Script {
                     match kind.to_ascii_lowercase().as_str() {
                         "i" => {
                             self.collect_value_args(1);
-                            args.push(unsafe { Self::script_params().read() } as u64);
+                            args.push(NativeArg::Integer(
+                                unsafe { Self::script_params().read() } as u64,
+                            ));
+                        }
+                        "f" => {
+                            self.collect_value_args(1);
+                            args.push(NativeArg::Float(
+                                unsafe { Self::script_params().read() },
+                            ));
                         }
                         "ref" => {
                             let ptr = self.read_variable_arg::<*mut u32>();
-                            args.push(ptr as usize as u64);
+                            args.push(NativeArg::Integer(ptr as usize as u64));
                         }
                         "resi" => {
-                            result_ptr = Some(self.read_variable_arg::<*mut u32>());
+                            integer_result_ptr = Some(self.read_variable_arg::<*mut u32>());
                         }
-                        "f" | "resf" => {
-                            self.stop_with_error(
-                                "Android 0DDE floating-point ABI is not ported yet".to_string(),
-                            );
-                            return Some(true);
+                        "resf" => {
+                            float_result_ptr = Some(self.read_variable_arg::<*mut u32>());
                         }
                         other => {
                             self.stop_with_error(format!(
@@ -1090,25 +1208,42 @@ impl Script {
                         }
                     }
 
-                    if args.len() > 8 {
+                    let integer_count = args
+                        .iter()
+                        .filter(|arg| matches!(arg, NativeArg::Integer(_)))
+                        .count();
+                    let float_count = args
+                        .iter()
+                        .filter(|arg| matches!(arg, NativeArg::Float(_)))
+                        .count();
+
+                    if integer_count > 8 || float_count > 8 {
                         self.stop_with_error(
-                            "Android 0DDE currently supports up to 8 integer/pointer arguments"
+                            "Android 0DDE exceeds the arm64 register argument limit"
                                 .to_string(),
                         );
                         return Some(true);
                     }
                 }
 
-                let Some(result) = self.call_integer_function(address, &args) else {
+                let Some((integer_result, float_result)) =
+                    self.call_mixed_function(address, &args)
+                else {
                     self.stop_with_error(format!(
                         "Android 0DDE target {address:#010x} is not callable on iOS"
                     ));
                     return Some(true);
                 };
 
-                if let Some(ptr) = result_ptr {
+                if let Some(ptr) = integer_result_ptr {
                     unsafe {
-                        ptr.write(result as u32);
+                        ptr.write(integer_result as u32);
+                    }
+                }
+
+                if let Some(ptr) = float_result_ptr {
+                    unsafe {
+                        ptr.write(float_result);
                     }
                 }
 
