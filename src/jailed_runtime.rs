@@ -11,7 +11,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         Mutex,
     },
 };
@@ -66,6 +66,28 @@ struct SegmentCommand64 {
     initprot: i32,
     nsects: u32,
     flags: u32,
+}
+
+const LC_SYMTAB: u32 = 0x2;
+const N_STAB: u8 = 0xe0;
+
+#[repr(C)]
+struct SymtabCommand {
+    cmd: u32,
+    cmdsize: u32,
+    symoff: u32,
+    nsyms: u32,
+    stroff: u32,
+    strsize: u32,
+}
+
+#[repr(C)]
+struct Nlist64 {
+    n_strx: u32,
+    n_type: u8,
+    n_sect: u8,
+    n_desc: u16,
+    n_value: u64,
 }
 
 extern "C" {
@@ -175,6 +197,97 @@ fn find_ios_pattern(pattern: &str, mut wanted_index: usize) -> Option<usize> {
     None
 }
 
+
+fn segment_name(bytes: &[u8; 16]) -> &str {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
+fn find_macho_symbol(name: &str) -> Option<usize> {
+    unsafe {
+        let header = _dyld_get_image_header(0);
+        if header.is_null() {
+            return None;
+        }
+
+        let slide = _dyld_get_image_vmaddr_slide(0);
+        let mut command = (header as *const u8).add(std::mem::size_of::<MachHeader64>());
+        let mut symtab: Option<&SymtabCommand> = None;
+        let mut linkedit: Option<&SegmentCommand64> = None;
+
+        for _ in 0..(*header).ncmds {
+            let load = &*(command as *const LoadCommand);
+            if load.cmdsize < std::mem::size_of::<LoadCommand>() as u32 {
+                return None;
+            }
+
+            if load.cmd == LC_SYMTAB
+                && load.cmdsize >= std::mem::size_of::<SymtabCommand>() as u32
+            {
+                symtab = Some(&*(command as *const SymtabCommand));
+            } else if load.cmd == LC_SEGMENT_64
+                && load.cmdsize >= std::mem::size_of::<SegmentCommand64>() as u32
+            {
+                let segment = &*(command as *const SegmentCommand64);
+                if segment_name(&segment.segname) == "__LINKEDIT" {
+                    linkedit = Some(segment);
+                }
+            }
+
+            command = command.add(load.cmdsize as usize);
+        }
+
+        let symtab = symtab?;
+        let linkedit = linkedit?;
+
+        let linkedit_base =
+            (linkedit.vmaddr as isize + slide - linkedit.fileoff as isize) as *const u8;
+        let symbols = linkedit_base.add(symtab.symoff as usize) as *const Nlist64;
+        let strings = linkedit_base.add(symtab.stroff as usize);
+
+        let mut candidates = Vec::with_capacity(2);
+        candidates.push(name.to_string());
+        candidates.push(format!("_{name}"));
+
+        for index in 0..symtab.nsyms as usize {
+            let entry = &*symbols.add(index);
+
+            if entry.n_value == 0
+                || entry.n_strx == 0
+                || entry.n_strx >= symtab.strsize
+                || entry.n_type & N_STAB != 0
+            {
+                continue;
+            }
+
+            let ptr = strings.add(entry.n_strx as usize).cast::<c_char>();
+            let Ok(symbol) = CStr::from_ptr(ptr).to_str() else {
+                continue;
+            };
+
+            if candidates.iter().any(|candidate| candidate == symbol) {
+                return Some((entry.n_value as isize + slide) as usize);
+            }
+        }
+    }
+
+    None
+}
+
+fn find_native_game_symbol(name: &str) -> Option<usize> {
+    let c_name = CString::new(name).ok()?;
+    let ptr = unsafe {
+        // Darwin RTLD_DEFAULT.
+        dlsym((-2isize) as *mut c_void, c_name.as_ptr())
+    };
+
+    if !ptr.is_null() {
+        return Some(ptr as usize);
+    }
+
+    find_macho_symbol(name)
+}
+
 unsafe fn read_global<T: Copy>(address: usize) -> T {
     (absolute(address) as *const T).read()
 }
@@ -197,6 +310,80 @@ static NEXT_FUNCTION_TOKEN: AtomicU32 = AtomicU32::new(0xC000_0000);
 static FUNCTION_TOKENS: Lazy<Mutex<HashMap<u32, usize>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static PENDING_INVOKES: Lazy<Mutex<Vec<usize>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+const MOBILE_MENU_ANDROID_SIZE: usize = 0x4c;
+const MOBILE_MENU_IOS_TARGET_BLIP_OFFSET: usize = 0x68;
+const MOBILE_MENU_ANDROID_TARGET_BLIP_OFFSET: usize = 0x48;
+const RADAR_TRACE_COUNT: usize = 175;
+const RADAR_TRACE_ANDROID_STRIDE: usize = 0x28;
+const RADAR_TRACE_IOS_STRIDE: usize = 0x30;
+
+static MOBILE_MENU_REAL: AtomicUsize = AtomicUsize::new(0);
+static RADAR_TRACE_REAL: AtomicUsize = AtomicUsize::new(0);
+static MOBILE_MENU_COMPAT: Lazy<Mutex<Box<[u8]>>> =
+    Lazy::new(|| Mutex::new(vec![0u8; MOBILE_MENU_ANDROID_SIZE].into_boxed_slice()));
+static RADAR_TRACE_COMPAT: Lazy<Mutex<Box<[u8]>>> = Lazy::new(|| {
+    Mutex::new(
+        vec![0u8; RADAR_TRACE_COUNT * RADAR_TRACE_ANDROID_STRIDE].into_boxed_slice()
+    )
+});
+
+fn refresh_mobile_menu_compat() {
+    let real = MOBILE_MENU_REAL.load(Ordering::SeqCst);
+    if real == 0 {
+        return;
+    }
+
+    let mut compat = MOBILE_MENU_COMPAT.lock().unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (real + MOBILE_MENU_IOS_TARGET_BLIP_OFFSET) as *const u8,
+            compat
+                .as_mut_ptr()
+                .add(MOBILE_MENU_ANDROID_TARGET_BLIP_OFFSET),
+            4,
+        );
+    }
+}
+
+fn refresh_radar_trace_compat() {
+    let real = RADAR_TRACE_REAL.load(Ordering::SeqCst);
+    if real == 0 {
+        return;
+    }
+
+    let mut compat = RADAR_TRACE_COMPAT.lock().unwrap();
+
+    for index in 0..RADAR_TRACE_COUNT {
+        let source = (real + index * RADAR_TRACE_IOS_STRIDE) as *const u8;
+        let destination = unsafe {
+            compat
+                .as_mut_ptr()
+                .add(index * RADAR_TRACE_ANDROID_STRIDE)
+        };
+
+        unsafe {
+            // Through m_nBlipSize the 32-bit and arm64 layouts are identical.
+            std::ptr::copy_nonoverlapping(source, destination, 0x20);
+
+            // Android has a 4-byte CEntryExit* at 0x20. Scripts generally only
+            // care about position/sprite data, so don't expose a truncated iOS pointer.
+            std::ptr::write_bytes(destination.add(0x20), 0, 4);
+
+            // On arm64 the 8-byte pointer shifts m_nRadarSprite and flag bytes
+            // from 0x24 to 0x28. Repack those bytes into Android's 0x28 layout.
+            std::ptr::copy_nonoverlapping(source.add(0x28), destination.add(0x24), 4);
+        }
+    }
+}
+
+fn refresh_android_adapter(name: &str) {
+    match name {
+        "gMobileMenu" => refresh_mobile_menu_compat(),
+        "_ZN6CRadar13ms_RadarTraceE" => refresh_radar_trace_compat(),
+        _ => {}
+    }
+}
 
 fn register_function_token(real: usize) -> u32 {
     if real == 0 {
@@ -380,6 +567,7 @@ impl Script {
 
         let regions = SYMBOL_REGIONS.lock().unwrap();
         for region in regions.iter() {
+            refresh_android_adapter(&region.name);
             let end = region.virtual_base.saturating_add(region.span);
             if address >= region.virtual_base
                 && address.saturating_add(size as u32) <= end
@@ -516,8 +704,8 @@ impl Script {
     }
 
     fn android_symbol(&self, name: &str) -> Option<(usize, bool, u32)> {
-        // Compatibility adapters for common CLEO Android exports whose 32-bit
-        // layout differs from the 64-bit iOS game.
+        // Synthetic 32-bit views for data whose iOS arm64 layout differs from
+        // the Android layout expected by existing CSA/CSI bytecode.
         match name {
             "_ZN6CCheat17m_aCheatFunctionsE" => {
                 return Some((
@@ -533,25 +721,36 @@ impl Script {
                     crate::jailed_cheats::CHEAT_COUNT as u32,
                 ));
             }
+            "gMobileMenu" => {
+                let real = find_native_game_symbol(name)?;
+                MOBILE_MENU_REAL.store(real, Ordering::SeqCst);
+                refresh_mobile_menu_compat();
+                let compat = MOBILE_MENU_COMPAT.lock().unwrap();
+                return Some((
+                    compat.as_ptr() as usize,
+                    false,
+                    MOBILE_MENU_ANDROID_SIZE as u32,
+                ));
+            }
+            "_ZN6CRadar13ms_RadarTraceE" => {
+                let real = find_native_game_symbol(name)?;
+                RADAR_TRACE_REAL.store(real, Ordering::SeqCst);
+                refresh_radar_trace_compat();
+                let compat = RADAR_TRACE_COMPAT.lock().unwrap();
+                return Some((
+                    compat.as_ptr() as usize,
+                    false,
+                    (RADAR_TRACE_COUNT * RADAR_TRACE_ANDROID_STRIDE) as u32,
+                ));
+            }
             _ => {}
         }
 
-        // Some symbols remain exported on iOS. Try dyld before consulting
-        // per-game compatibility adapters.
-        let c_name = CString::new(name).ok()?;
-        let ptr = unsafe {
-            // Darwin RTLD_DEFAULT is ((void *)-2).
-            dlsym((-2isize) as *mut c_void, c_name.as_ptr())
-        };
-
-        if !ptr.is_null() {
-            return Some((ptr as usize, false, SYMBOL_VIRTUAL_SPAN));
-        }
-
-        // Stripped GTA globals such as gMobileMenu and CRadar::ms_RadarTrace
-        // require explicit iOS adapters because their 64-bit structure layouts
-        // are not binary-compatible with Android's 32-bit structures.
-        None
+        // Direct mapping is safe for symbols whose consumer doesn't depend on a
+        // 32-bit structure layout. Start with exported symbols, then use Mach-O's
+        // local nlist table when the App Store binary kept the symbol locally.
+        let ptr = find_native_game_symbol(name)?;
+        Some((ptr, false, SYMBOL_VIRTUAL_SPAN))
     }
 
     fn update_android_opcode(&mut self, opcode: u16) -> Option<bool> {
