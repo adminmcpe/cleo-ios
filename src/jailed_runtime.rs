@@ -159,6 +159,24 @@ fn absolute(address: usize) -> usize {
     address + game_slide()
 }
 
+fn enforce_60_fps_cap() -> bool {
+    static VERIFIED: Lazy<bool> = Lazy::new(|| {
+        let cap = absolute(FPS_CAP_ADDR);
+        segment_info(cap)
+            .map(|(_, writable, executable)| writable && !executable)
+            .unwrap_or(false)
+    });
+
+    if !*VERIFIED {
+        return false;
+    }
+
+    unsafe {
+        (absolute(FPS_CAP_ADDR) as *mut u32).write(60);
+    }
+    true
+}
+
 fn android_str_hash(value: &str) -> u32 {
     let mut hash = 0u32;
     for byte in value.bytes() {
@@ -1930,12 +1948,7 @@ impl Script {
         }
 
         if self.special == SpecialScript::Fps60 {
-            let cap = absolute(FPS_CAP_ADDR);
-            if segment_info(cap).map(|(_, writable, _)| writable).unwrap_or(false) {
-                unsafe {
-                    (cap as *mut u32).write(60);
-                }
-            } else {
+            if !enforce_60_fps_cap() {
                 self.stop_with_error(
                     "60 FPS adapter could not verify the iOS frame-cap variable".to_string(),
                 );
@@ -2163,6 +2176,11 @@ pub fn tick() {
     if !now_in_game {
         return;
     }
+
+    // Original CLEO iOS defaults to a 60 FPS cap. Enforce the same verified
+    // iOS game variable every jailed runtime tick so GTA cannot restore 30 FPS
+    // after loading, pausing, opening a menu, or executing an Android script.
+    let _ = enforce_60_fps_cap();
 
     // Execute built-in cheats only from the jailed game-runtime tick, after the
     // UIKit overlay has closed. This keeps weapon/vehicle cheats on the main
