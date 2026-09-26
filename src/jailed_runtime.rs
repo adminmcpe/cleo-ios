@@ -1,7 +1,7 @@
 //! Jailed CLEO script runtime.
 //!
 //! This module deliberately does not patch executable memory. It drives CLEO scripts
-//! from an NSTimer installed on the main thread and calls the game's existing SCM
+//! from a CADisplayLink installed on the main thread and calls the game's existing SCM
 //! opcode handlers directly. The addresses match the CLEO 2.6.0 GTA:SA target.
 
 use once_cell::sync::Lazy;
@@ -879,6 +879,8 @@ struct Script {
     virtual_base: u32,
     context: [u64; 32],
     special: SpecialScript,
+    text_style: TextDrawState,
+    text_frame: Vec<crate::jailed::ScriptTextDraw>,
 }
 
 unsafe impl Send for Script {}
@@ -888,6 +890,29 @@ enum NativeArg {
     Integer(u64),
     Float(u32),
 }
+#[derive(Debug, Clone, Copy)]
+struct TextDrawState {
+    scale_x: f32,
+    scale_y: f32,
+    rgba: [u8; 4],
+    centered: bool,
+    right_aligned: bool,
+    outline: bool,
+}
+
+impl Default for TextDrawState {
+    fn default() -> Self {
+        Self {
+            scale_x: 0.30,
+            scale_y: 1.00,
+            rgba: [255, 255, 255, 255],
+            centered: false,
+            right_aligned: false,
+            outline: false,
+        }
+    }
+}
+
 
 impl Script {
     fn new(kind: Kind, bytes: Vec<u8>, name: String) -> Self {
@@ -907,6 +932,8 @@ impl Script {
             virtual_base: NEXT_SCRIPT_VBASE.fetch_add(SCRIPT_VIRTUAL_STRIDE, Ordering::SeqCst),
             context: [0; 32],
             special,
+            text_style: TextDrawState::default(),
+            text_frame: Vec::new(),
         }
     }
 
@@ -915,6 +942,8 @@ impl Script {
         self.game = GameScript::new(base, active);
         self.error = None;
         self.context = [0; 32];
+        self.text_style = TextDrawState::default();
+        self.text_frame.clear();
     }
 
     fn stop_with_error(&mut self, message: String) {
@@ -1168,6 +1197,169 @@ impl Script {
             .get(&key.to_ascii_uppercase())
             .cloned()
             .unwrap_or_else(|| key.to_string())
+    }
+
+    fn lookup_fxt(key: &str) -> Option<String> {
+        FXT_MAP
+            .lock()
+            .unwrap()
+            .get(&key.to_ascii_uppercase())
+            .cloned()
+    }
+
+    fn format_fxt_numbers(mut text: String, numbers: &[i32]) -> String {
+        for number in numbers {
+            if let Some(index) = text.find("~1~") {
+                text.replace_range(index..index + 3, &number.to_string());
+            }
+        }
+        text
+    }
+
+    fn mirror_text_draw_state(&mut self, opcode: u16) {
+        let saved_ip = self.game.ip;
+
+        match opcode {
+            0x033f => {
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                self.text_style.scale_x =
+                    f32::from_bits(unsafe { params.read() }).clamp(0.05, 4.0);
+                self.text_style.scale_y =
+                    f32::from_bits(unsafe { params.add(1).read() }).clamp(0.05, 4.0);
+            }
+            0x0340 => {
+                self.collect_value_args(4);
+                let params = Self::script_params();
+                for index in 0..4usize {
+                    self.text_style.rgba[index] =
+                        unsafe { params.add(index).read() }.min(255) as u8;
+                }
+            }
+            0x0342 => {
+                self.collect_value_args(1);
+                self.text_style.centered = unsafe { Self::script_params().read() } != 0;
+                if self.text_style.centered {
+                    self.text_style.right_aligned = false;
+                }
+            }
+            0x03e4 => {
+                self.collect_value_args(1);
+                self.text_style.right_aligned = unsafe { Self::script_params().read() } != 0;
+                if self.text_style.right_aligned {
+                    self.text_style.centered = false;
+                }
+            }
+            0x081c => {
+                self.collect_value_args(5);
+                self.text_style.outline = unsafe { Self::script_params().read() } != 0;
+            }
+            0x03f0 => {
+                self.collect_value_args(1);
+                let enabled = unsafe { Self::script_params().read() } != 0;
+                if !enabled {
+                    crate::jailed::render_script_text_frame(std::mem::take(&mut self.text_frame));
+                }
+            }
+            _ => return,
+        }
+
+        self.game.ip = saved_ip;
+    }
+
+    fn push_custom_text(&mut self, x: f32, y: f32, text: String) {
+        self.text_frame.push(crate::jailed::ScriptTextDraw {
+            x,
+            y,
+            scale_x: self.text_style.scale_x,
+            scale_y: self.text_style.scale_y,
+            rgba: self.text_style.rgba,
+            centered: self.text_style.centered,
+            right_aligned: self.text_style.right_aligned,
+            outline: self.text_style.outline,
+            text,
+        });
+    }
+
+    fn update_custom_fxt_draw_opcode(&mut self, opcode: u16) -> Option<bool> {
+        let saved_ip = self.game.ip;
+
+        match opcode {
+            0x033e => {
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                let x = f32::from_bits(unsafe { params.read() });
+                let y = f32::from_bits(unsafe { params.add(1).read() });
+                let key = match self.read_8byte_string_param() {
+                    Some(Some(value)) => value,
+                    _ => {
+                        self.game.ip = saved_ip;
+                        return None;
+                    }
+                };
+
+                let Some(text) = Self::lookup_fxt(&key) else {
+                    self.game.ip = saved_ip;
+                    return None;
+                };
+
+                self.push_custom_text(x, y, text);
+                Some(false)
+            }
+            0x045a => {
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                let x = f32::from_bits(unsafe { params.read() });
+                let y = f32::from_bits(unsafe { params.add(1).read() });
+                let key = match self.read_8byte_string_param() {
+                    Some(Some(value)) => value,
+                    _ => {
+                        self.game.ip = saved_ip;
+                        return None;
+                    }
+                };
+                self.collect_value_args(1);
+                let number = unsafe { Self::script_params().read() } as i32;
+
+                let Some(text) = Self::lookup_fxt(&key) else {
+                    self.game.ip = saved_ip;
+                    return None;
+                };
+
+                self.push_custom_text(x, y, Self::format_fxt_numbers(text, &[number]));
+                Some(false)
+            }
+            0x045b => {
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                let x = f32::from_bits(unsafe { params.read() });
+                let y = f32::from_bits(unsafe { params.add(1).read() });
+                let key = match self.read_8byte_string_param() {
+                    Some(Some(value)) => value,
+                    _ => {
+                        self.game.ip = saved_ip;
+                        return None;
+                    }
+                };
+                self.collect_value_args(2);
+                let params = Self::script_params();
+                let first = unsafe { params.read() } as i32;
+                let second = unsafe { params.add(1).read() } as i32;
+
+                let Some(text) = Self::lookup_fxt(&key) else {
+                    self.game.ip = saved_ip;
+                    return None;
+                };
+
+                self.push_custom_text(
+                    x,
+                    y,
+                    Self::format_fxt_numbers(text, &[first, second]),
+                );
+                Some(false)
+            }
+            _ => None,
+        }
     }
 
     fn android_symbol(&self, name: &str) -> Option<(usize, bool, u32)> {
@@ -1863,6 +2055,12 @@ impl Script {
             return can_interrupt;
         }
 
+        self.mirror_text_draw_state(opcode);
+
+        if let Some(can_interrupt) = self.update_custom_fxt_draw_opcode(opcode) {
+            return can_interrupt;
+        }
+
         // Never pass an unknown CLEO-Android opcode into GTA's generic mobile
         // extended-opcode handler. The numeric range belongs to CLEO Android;
         // forwarding an unsupported one can jump through unrelated handler logic
@@ -2141,6 +2339,7 @@ fn begin_game_session() {
 
 fn end_game_session() {
     *WAYPOINT_SCAN_CACHE.lock().unwrap() = (u32::MAX, None);
+    crate::jailed::hide_script_text_overlay();
     CSA_AUTOSTART_DONE.store(false, Ordering::SeqCst);
     CSA_START_AFTER.store(0, Ordering::SeqCst);
     unsafe {
@@ -2163,6 +2362,8 @@ pub fn tick() {
         return;
     }
 
+    crate::jailed::begin_script_text_tick();
+
     let game_state = unsafe { read_global::<u32>(GAME_STATE_ADDR) };
     let now_in_game = game_state == 9;
     let was_in_game = IN_GAME.swap(now_in_game, Ordering::SeqCst);
@@ -2174,6 +2375,7 @@ pub fn tick() {
     }
 
     if !now_in_game {
+        crate::jailed::end_script_text_tick();
         return;
     }
 
@@ -2240,6 +2442,9 @@ pub fn tick() {
             }
         }
     }
+
+    drop(scripts);
+    crate::jailed::end_script_text_tick();
 }
 
 #[derive(Debug, Clone)]
