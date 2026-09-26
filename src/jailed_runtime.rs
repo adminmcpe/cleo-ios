@@ -96,6 +96,7 @@ struct Nlist64 {
 }
 
 extern "C" {
+    fn _dyld_image_count() -> u32;
     fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
     fn _dyld_get_image_header(image_index: u32) -> *const MachHeader64;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
@@ -143,16 +144,86 @@ extern "C" {
     );
 }
 
-fn game_slide() -> usize {
-    static SLIDE: Lazy<usize> = Lazy::new(|| unsafe {
-        // CLEO 2.6.0 used the smaller slide of image 0 / image 1 because the
-        // game image moved between those positions on newer iOS releases.
-        let a = _dyld_get_image_vmaddr_slide(0).max(0) as usize;
-        let b = _dyld_get_image_vmaddr_slide(1).max(0) as usize;
-        a.min(b)
+fn image_contains_preferred_address(
+    image_index: u32,
+    preferred_address: usize,
+    require_write: bool,
+) -> bool {
+    unsafe {
+        let header = _dyld_get_image_header(image_index);
+        if header.is_null() {
+            return false;
+        }
+
+        let mut command =
+            (header as *const u8).add(std::mem::size_of::<MachHeader64>());
+
+        for _ in 0..(*header).ncmds {
+            let load = &*(command as *const LoadCommand);
+            if load.cmdsize < std::mem::size_of::<LoadCommand>() as u32 {
+                return false;
+            }
+
+            if load.cmd == LC_SEGMENT_64
+                && load.cmdsize >= std::mem::size_of::<SegmentCommand64>() as u32
+            {
+                let segment = &*(command as *const SegmentCommand64);
+                let start = segment.vmaddr as usize;
+                let end = start.saturating_add(segment.vmsize as usize);
+
+                if preferred_address >= start
+                    && preferred_address < end
+                    && (!require_write || (segment.initprot & VM_PROT_WRITE) != 0)
+                {
+                    return true;
+                }
+            }
+
+            command = command.add(load.cmdsize as usize);
+        }
+    }
+
+    false
+}
+
+fn game_image_index() -> u32 {
+    static INDEX: Lazy<u32> = Lazy::new(|| unsafe {
+        let count = _dyld_image_count();
+
+        // GAME_STATE_ADDR is a known writable variable in GTA:SA 2.02.11.
+        // Identify the actual game Mach-O by preferred VM address instead of
+        // assuming the game is always dyld image 0 or taking the smaller slide.
+        for index in 0..count {
+            if image_contains_preferred_address(index, GAME_STATE_ADDR, true) {
+                return index;
+            }
+        }
+
+        // Main executables are normally image 0. Keep a deterministic fallback
+        // rather than guessing between unrelated dylibs.
+        0
     });
 
-    *SLIDE
+    *INDEX
+}
+
+pub(crate) fn game_slide() -> usize {
+    unsafe { _dyld_get_image_vmaddr_slide(game_image_index()).max(0) as usize }
+}
+
+fn canonical_runtime_address(address: usize) -> usize {
+    // arm64e function pointers may contain pointer-authentication bits in the
+    // upper part of the value. Strip only for range validation; calls still use
+    // the original authenticated function pointer.
+    #[cfg(target_arch = "aarch64")]
+    {
+        address & 0x0000_FFFF_FFFF_FFFFusize
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        address
+    }
 }
 
 fn absolute(address: usize) -> usize {
@@ -213,12 +284,12 @@ fn find_ios_pattern(pattern: &str, mut wanted_index: usize) -> Option<usize> {
     let pattern = parse_pattern(pattern)?;
 
     unsafe {
-        let header = _dyld_get_image_header(0);
+        let header = _dyld_get_image_header(game_image_index());
         if header.is_null() {
             return None;
         }
 
-        let slide = _dyld_get_image_vmaddr_slide(0);
+        let slide = _dyld_get_image_vmaddr_slide(game_image_index());
         let mut command = (header as *const u8).add(std::mem::size_of::<MachHeader64>());
 
         for _ in 0..(*header).ncmds {
@@ -270,12 +341,12 @@ fn segment_name(bytes: &[u8; 16]) -> &str {
 
 fn find_macho_symbol(name: &str) -> Option<usize> {
     unsafe {
-        let header = _dyld_get_image_header(0);
+        let header = _dyld_get_image_header(game_image_index());
         if header.is_null() {
             return None;
         }
 
-        let slide = _dyld_get_image_vmaddr_slide(0);
+        let slide = _dyld_get_image_vmaddr_slide(game_image_index());
         let mut command = (header as *const u8).add(std::mem::size_of::<MachHeader64>());
         let mut symtab: Option<&SymtabCommand> = None;
         let mut linkedit: Option<&SegmentCommand64> = None;
@@ -340,13 +411,15 @@ fn find_macho_symbol(name: &str) -> Option<usize> {
 }
 
 fn segment_info(address: usize) -> Option<(usize, bool, bool)> {
+    let address = canonical_runtime_address(address);
+
     unsafe {
-        let header = _dyld_get_image_header(0);
+        let header = _dyld_get_image_header(game_image_index());
         if header.is_null() {
             return None;
         }
 
-        let slide = _dyld_get_image_vmaddr_slide(0);
+        let slide = _dyld_get_image_vmaddr_slide(game_image_index());
         let mut command =
             (header as *const u8).add(std::mem::size_of::<MachHeader64>());
 
@@ -360,7 +433,9 @@ fn segment_info(address: usize) -> Option<(usize, bool, bool)> {
                 && load.cmdsize >= std::mem::size_of::<SegmentCommand64>() as u32
             {
                 let segment = &*(command as *const SegmentCommand64);
-                let start = (segment.vmaddr as isize + slide) as usize;
+                let start = canonical_runtime_address(
+                    (segment.vmaddr as isize + slide) as usize
+                );
                 let end = start.saturating_add(segment.vmsize as usize);
 
                 if address >= start && address < end {
@@ -590,12 +665,12 @@ fn scan_waypoint_from_game_data() -> Option<(f32, f32, f32)> {
     let mut best: Option<(i32, f32, f32, f32)> = None;
 
     unsafe {
-        let header = _dyld_get_image_header(0);
+        let header = _dyld_get_image_header(game_image_index());
         if header.is_null() {
             return None;
         }
 
-        let slide = _dyld_get_image_vmaddr_slide(0);
+        let slide = _dyld_get_image_vmaddr_slide(game_image_index());
         let mut command = (header as *const u8).add(std::mem::size_of::<MachHeader64>());
 
         for _ in 0..(*header).ncmds {
