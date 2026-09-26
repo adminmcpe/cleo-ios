@@ -33,6 +33,7 @@ const SYMBOL_VIRTUAL_STRIDE: u32 = 0x0010_0000;
 const SYMBOL_VIRTUAL_SPAN: u32 = 0x0010_0000;
 
 const LC_SEGMENT_64: u32 = 0x19;
+const VM_PROT_WRITE: i32 = 0x2;
 const VM_PROT_EXECUTE: i32 = 0x4;
 
 #[repr(C)]
@@ -366,30 +367,204 @@ static RADAR_TRACE_COMPAT: Lazy<Mutex<Box<[u8]>>> = Lazy::new(|| {
     )
 });
 
-fn target_blip_coords_from_game() -> Option<(f32, f32, f32)> {
-    // CLEO/mobile command 0AB6 GET_TARGET_BLIP_COORDINATES is already handled
-    // by GTA's own extended opcode handler on this iOS build. Run it against a
-    // tiny scratch script and use local variables 0@, 1@ and 2@ as outputs.
-    let params: [u8; 9] = [
-        0x03, 0x00, 0x00, // 0@
-        0x03, 0x04, 0x00, // 1@
-        0x03, 0x08, 0x00, // 2@
-    ];
+#[derive(Clone, Copy)]
+struct RadarLayout {
+    stride: usize,
+    sprite_offset: usize,
+}
 
-    let mut script = GameScript::new(params.as_ptr().cast::<u16>(), true);
-    type Handler = fn(*mut GameScript, u16) -> u8;
-    let handler: Handler = unsafe { std::mem::transmute(absolute(EXTENDED_HANDLER_ADDR)) };
-    let _ = handler(&mut script, 0x0ab6);
+const RADAR_LAYOUTS: [RadarLayout; 2] = [
+    // Original 32-bit mobile tRadarTrace.
+    RadarLayout { stride: 0x28, sprite_offset: 0x24 },
+    // arm64 layout when the CEntryExit pointer expands to 8 bytes.
+    RadarLayout { stride: 0x30, sprite_offset: 0x28 },
+];
 
-    let x = f32::from_bits(script.locals[0]);
-    let y = f32::from_bits(script.locals[1]);
-    let z = f32::from_bits(script.locals[2]);
+fn slice_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let data: [u8; 2] = bytes.get(offset..offset + 2)?.try_into().ok()?;
+    Some(u16::from_le_bytes(data))
+}
 
-    if x.is_finite() && y.is_finite() && z.is_finite() {
-        Some((x, y, z))
-    } else {
-        None
+fn slice_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let data: [u8; 4] = bytes.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(data))
+}
+
+fn slice_f32(bytes: &[u8], offset: usize) -> Option<f32> {
+    Some(f32::from_bits(slice_u32(bytes, offset)?))
+}
+
+fn radar_record_looks_valid(bytes: &[u8], start: usize, layout: RadarLayout) -> bool {
+    if start.checked_add(layout.stride).map_or(true, |end| end > bytes.len()) {
+        return false;
     }
+
+    let Some(colour) = slice_u32(bytes, start) else {
+        return false;
+    };
+    let Some(x) = slice_f32(bytes, start + 0x08) else {
+        return false;
+    };
+    let Some(y) = slice_f32(bytes, start + 0x0c) else {
+        return false;
+    };
+    let Some(z) = slice_f32(bytes, start + 0x10) else {
+        return false;
+    };
+    let Some(radius) = slice_f32(bytes, start + 0x18) else {
+        return false;
+    };
+    let Some(blip_size) = slice_u16(bytes, start + 0x1c) else {
+        return false;
+    };
+    let Some(&sprite) = bytes.get(start + layout.sprite_offset) else {
+        return false;
+    };
+
+    // These are deliberately broad sanity checks. They distinguish the radar
+    // array from arbitrary writable data without assuming one exact game state.
+    colour <= 8
+        && x.is_finite()
+        && y.is_finite()
+        && z.is_finite()
+        && radius.is_finite()
+        && x.abs() <= 100_000.0
+        && y.abs() <= 100_000.0
+        && z.abs() <= 100_000.0
+        && radius.abs() <= 100_000.0
+        && blip_size <= 64
+        && (sprite <= 64 || sprite >= 251)
+}
+
+fn waypoint_candidate_score(
+    bytes: &[u8],
+    record_start: usize,
+    layout: RadarLayout,
+) -> Option<(i32, f32, f32, f32)> {
+    if !radar_record_looks_valid(bytes, record_start, layout) {
+        return None;
+    }
+
+    if *bytes.get(record_start + layout.sprite_offset)? != 41 {
+        return None;
+    }
+
+    let x = slice_f32(bytes, record_start + 0x08)?;
+    let y = slice_f32(bytes, record_start + 0x0c)?;
+    let z = slice_f32(bytes, record_start + 0x10)?;
+
+    // San Andreas' playable map is roughly +/-3000. Leave headroom for mods,
+    // but reject obvious non-coordinate values and the zeroed unused record.
+    if x.abs() > 10_000.0
+        || y.abs() > 10_000.0
+        || z.abs() > 20_000.0
+        || (x.abs() < 0.001 && y.abs() < 0.001)
+    {
+        return None;
+    }
+
+    let mut score = 20i32;
+
+    // A real radar trace lives inside a contiguous array. Random byte 41 values
+    // in __DATA are very unlikely to have valid tRadarTrace records on both sides.
+    for delta in [-3isize, -2, -1, 1, 2, 3] {
+        let byte_delta = delta.saturating_mul(layout.stride as isize);
+        let neighbour = record_start as isize + byte_delta;
+        if neighbour < 0 {
+            continue;
+        }
+
+        if radar_record_looks_valid(bytes, neighbour as usize, layout) {
+            score += 4;
+        }
+    }
+
+    let colour = slice_u32(bytes, record_start).unwrap_or(u32::MAX);
+    if colour == 8 {
+        score += 4;
+    }
+
+    let blip_size = slice_u16(bytes, record_start + 0x1c).unwrap_or(u16::MAX);
+    if blip_size <= 4 {
+        score += 2;
+    }
+
+    Some((score, x, y, z))
+}
+
+fn scan_waypoint_from_game_data() -> Option<(f32, f32, f32)> {
+    let mut best: Option<(i32, f32, f32, f32)> = None;
+
+    unsafe {
+        let header = _dyld_get_image_header(0);
+        if header.is_null() {
+            return None;
+        }
+
+        let slide = _dyld_get_image_vmaddr_slide(0);
+        let mut command = (header as *const u8).add(std::mem::size_of::<MachHeader64>());
+
+        for _ in 0..(*header).ncmds {
+            let load = &*(command as *const LoadCommand);
+            if load.cmdsize < std::mem::size_of::<LoadCommand>() as u32 {
+                return None;
+            }
+
+            if load.cmd == LC_SEGMENT_64
+                && load.cmdsize >= std::mem::size_of::<SegmentCommand64>() as u32
+            {
+                let segment = &*(command as *const SegmentCommand64);
+
+                // The live radar pool is writable game data. Never scan executable
+                // pages or giant mappings, and never dereference outside a segment.
+                if segment.initprot & VM_PROT_WRITE != 0
+                    && segment.vmsize >= 0x1000
+                    && segment.vmsize <= 128 * 1024 * 1024
+                {
+                    let start = (segment.vmaddr as isize + slide) as *const u8;
+                    let size = segment.vmsize as usize;
+                    let bytes = std::slice::from_raw_parts(start, size);
+
+                    for layout in RADAR_LAYOUTS {
+                        if size <= layout.sprite_offset {
+                            continue;
+                        }
+
+                        for sprite_pos in layout.sprite_offset..size {
+                            if bytes[sprite_pos] != 41 {
+                                continue;
+                            }
+
+                            let record_start = sprite_pos - layout.sprite_offset;
+                            let Some(candidate) =
+                                waypoint_candidate_score(bytes, record_start, layout)
+                            else {
+                                continue;
+                            };
+
+                            if best.map_or(true, |current| candidate.0 > current.0) {
+                                best = Some(candidate);
+                            }
+                        }
+                    }
+                }
+            }
+
+            command = command.add(load.cmdsize as usize);
+        }
+    }
+
+    best.map(|(_, x, y, z)| (x, y, z))
+}
+
+fn target_blip_coords_from_game() -> Option<(f32, f32, f32)> {
+    // Do not call opcode 0AB6 through the game's generic mobile handler here.
+    // 0AB6 is a CLEO extension, not a native GTA SCM command. Calling the wrong
+    // handler can return a stable but unrelated location, which is exactly what
+    // caused teleport.csi to keep sending the player to the same place.
+    //
+    // Instead, locate the live waypoint record in GTA's writable radar pool.
+    scan_waypoint_from_game_data()
 }
 
 fn refresh_marker_compat() {
