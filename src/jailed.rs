@@ -755,8 +755,14 @@ extern "C" fn handle_menu_button(_this: &Object, _cmd: Sel, button: *mut Object)
 
         if (TAG_CSA_BASE..TAG_CHEAT_BASE).contains(&tag) {
             let index = (tag - TAG_CSA_BASE) as usize;
-            crate::jailed_runtime::toggle_csa(index);
-            render_selected_tab();
+            if crate::jailed_runtime::toggle_csa(index) {
+                // A CSA may draw its own Android/RZL menu on the next frame.
+                // Close the CLEO browser immediately so that script-owned UI is
+                // not hidden behind the main overlay.
+                hide_menu();
+            } else {
+                render_selected_tab();
+            }
             return;
         }
 
