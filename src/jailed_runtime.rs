@@ -1248,21 +1248,25 @@ impl Script {
 
         unsafe {
             let p = self.game.ip.cast::<u8>();
-            let tag = p.read();
 
-            if tag == 0 {
+            // CLEO Android OP_CALL_FUNCTION does not use a normal SCM string
+            // parameter tag here. It reads eight raw bytes directly from the
+            // script stream; a single zero byte terminates the typed argument
+            // list. Mirroring that byte-for-byte is required for existing
+            // Android .csa/.csi binaries.
+            if p.read() == 0 {
                 self.game.ip = p.add(1).cast::<u16>();
                 return Some(None);
             }
 
-            if tag != 0x09 || offset.saturating_add(9) > self.bytes.len() {
+            if offset.saturating_add(8) > self.bytes.len() {
                 return None;
             }
 
-            let bytes = std::slice::from_raw_parts(p.add(1), 8);
+            let bytes = std::slice::from_raw_parts(p, 8);
             let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
             let value = String::from_utf8(bytes[..end].to_vec()).ok()?;
-            self.game.ip = p.add(9).cast::<u16>();
+            self.game.ip = p.add(8).cast::<u16>();
             Some(Some(value))
         }
     }
