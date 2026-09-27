@@ -2726,27 +2726,23 @@ pub fn toggle_csa(index: usize) -> bool {
         return false;
     };
 
-    script.enabled = !script.enabled;
-    runtime_log(&format!(
-        "[CSA] {} -> {}",
-        script.name,
-        if script.enabled { "enabled" } else { "disabled" }
-    ));
+    // Android CLEO auto-starts .csa files. In the jailed menu, tapping a CSA
+    // should therefore mean "run/restart", not silently disable a script that
+    // was already enabled at startup. This also makes one-shot CSA files usable
+    // from the menu after they have reached end_thread.
+    script.enabled = true;
 
-    if script.enabled && in_game {
+    if in_game {
+        crate::jailed::hide_android_menu();
         script.reset(true);
+
         if script.special == SpecialScript::Fps60 {
-            unsafe {
-                (absolute(FPS_CAP_ADDR) as *mut u32).write(60);
-            }
+            let _ = enforce_60_fps_cap();
         }
-    } else if !script.enabled {
-        script.game.active = false;
-        if script.special == SpecialScript::Fps60 {
-            unsafe {
-                (absolute(FPS_CAP_ADDR) as *mut u32).write(30);
-            }
-        }
+
+        runtime_log(&format!("[CSA] restarted {}", script.name));
+    } else {
+        runtime_log(&format!("[CSA] armed {} (waiting for gameplay)", script.name));
     }
 
     true
