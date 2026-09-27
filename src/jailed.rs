@@ -54,6 +54,7 @@ const TAG_TAB_CSI: i64 = 10;
 const TAG_TAB_CSA: i64 = 11;
 const TAG_TAB_CHEATS: i64 = 12;
 const TAG_TAB_OPTIONS: i64 = 13;
+const TAG_TAB_RZL: i64 = 14;
 const TAG_CSI_BASE: i64 = 1000;
 const TAG_CSA_BASE: i64 = 2000;
 const TAG_CHEAT_BASE: i64 = 3000;
@@ -63,7 +64,7 @@ const TAG_ANDROID_CLOSE: i64 = 19_999;
 static GESTURE_TARGET: OnceCell<usize> = OnceCell::new();
 static OVERLAY: AtomicUsize = AtomicUsize::new(0);
 static CONTENT_VIEW: AtomicUsize = AtomicUsize::new(0);
-static TAB_BUTTONS: Lazy<Mutex<[usize; 4]>> = Lazy::new(|| Mutex::new([0; 4]));
+static TAB_BUTTONS: Lazy<Mutex<[usize; 5]>> = Lazy::new(|| Mutex::new([0; 5]));
 static SELECTED_TAB: AtomicUsize = AtomicUsize::new(TAG_TAB_CSI as usize);
 static TIMER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static ANDROID_MENU_OVERLAY: AtomicUsize = AtomicUsize::new(0);
@@ -335,7 +336,7 @@ fn set_tab_style(button: *mut Object, selected: bool) {
 
 fn refresh_tab_styles() {
     let selected = SELECTED_TAB.load(Ordering::SeqCst) as i64;
-    let tags = [TAG_TAB_CSI, TAG_TAB_CSA, TAG_TAB_CHEATS, TAG_TAB_OPTIONS];
+    let tags = [TAG_TAB_CSI, TAG_TAB_CSA, TAG_TAB_CHEATS, TAG_TAB_OPTIONS, TAG_TAB_RZL];
     let buttons = TAB_BUTTONS.lock().unwrap();
 
     for (index, button) in buttons.iter().enumerate() {
@@ -585,6 +586,32 @@ fn add_cheat_rows(parent: *mut Object, width: f64) {
     set_scroll_height(parent, width, (row_count as f64 * IOS_CLEO_ROW_HEIGHT).max(IOS_CLEO_ROW_HEIGHT));
 }
 
+fn add_rzl_menu_rows(parent: *mut Object, width: f64) {
+    // Display-only mirror of the RZL Trainer main menu from the supplied FXT.
+    // Intentionally does not invoke or modify any CSI/CSA script.
+    let rows = [
+        ("RZL-TRAINER", "Author : Rizal"),
+        ("Player Option >", ""),
+        ("Vehicle Option >", ""),
+        ("Wanted Option >", ""),
+        ("Weapon Option >", ""),
+        ("Teleport Option >", ""),
+        ("Mission Option >", ""),
+        ("Time Option >", ""),
+        ("Weather Option >", ""),
+        ("Misc Option >", ""),
+        ("Settings >", ""),
+    ];
+
+    let mut y = 0.0;
+    for (title, detail) in rows {
+        add_row(parent, y, width, title, detail, "");
+        y += IOS_CLEO_ROW_HEIGHT;
+    }
+
+    set_scroll_height(parent, width, y.max(IOS_CLEO_ROW_HEIGHT));
+}
+
 fn clear_content() {
     let content = CONTENT_VIEW.load(Ordering::SeqCst) as *mut Object;
     if content.is_null() {
@@ -624,6 +651,7 @@ fn render_selected_tab() {
             TAG_TAB_CSI => add_script_rows(content, width, "csi"),
             TAG_TAB_CSA => add_script_rows(content, width, "csa"),
             TAG_TAB_CHEATS => add_cheat_rows(content, width),
+            TAG_TAB_RZL => add_rzl_menu_rows(content, width),
             _ => {
                 add_row(
                     content,
@@ -737,7 +765,7 @@ extern "C" fn handle_menu_button(_this: &Object, _cmd: Sel, button: *mut Object)
             return;
         }
 
-        if (TAG_TAB_CSI..=TAG_TAB_OPTIONS).contains(&tag) {
+        if (TAG_TAB_CSI..=TAG_TAB_RZL).contains(&tag) {
             SELECTED_TAB.store(tag as usize, Ordering::SeqCst);
             render_selected_tab();
             return;
@@ -1149,12 +1177,12 @@ fn show_menu() {
                 t as usize
             }) as *mut Object;
 
-        let tab_w = bounds.size.width / 4.0;
-        let tags = [TAG_TAB_CSI, TAG_TAB_CSA, TAG_TAB_CHEATS, TAG_TAB_OPTIONS];
-        let titles = ["CSI", "CSA", "Cheats", "Options"];
-        let mut buttons = [0usize; 4];
+        let tab_w = bounds.size.width / 5.0;
+        let tags = [TAG_TAB_CSI, TAG_TAB_CSA, TAG_TAB_CHEATS, TAG_TAB_OPTIONS, TAG_TAB_RZL];
+        let titles = ["CSI", "CSA", "Cheats", "Options", "RZL"];
+        let mut buttons = [0usize; 5];
 
-        for index in 0..4 {
+        for index in 0..5 {
             let button = add_tab_button(
                 menu_parent,
                 target,
@@ -1225,7 +1253,7 @@ fn show_menu() {
 fn hide_menu() {
     let current = OVERLAY.swap(0, Ordering::SeqCst);
     CONTENT_VIEW.store(0, Ordering::SeqCst);
-    *TAB_BUTTONS.lock().unwrap() = [0; 4];
+    *TAB_BUTTONS.lock().unwrap() = [0; 5];
 
     if current == 0 {
         return;
