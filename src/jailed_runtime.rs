@@ -1000,10 +1000,10 @@ impl Script {
             bytes,
             game: GameScript::new(ip, false),
             name,
-            // Keep arbitrary Android CSA scripts on safe-start, but the known
-            // 60 FPS compatibility adapter is an iOS-side cap writer and is safe to
-            // enable automatically just like original CLEO iOS defaults to 60 FPS.
-            enabled: special == SpecialScript::Fps60,
+            // CLEO Android automatically launches every .csa script.
+            // We preserve that behaviour, but begin_game_session() still delays
+            // arbitrary CSA bytecode for a few seconds after entering gameplay.
+            enabled: kind == Kind::Csa,
             error: None,
             virtual_base: NEXT_SCRIPT_VBASE.fetch_add(SCRIPT_VIRTUAL_STRIDE, Ordering::SeqCst),
             context: [0; 32],
@@ -2101,6 +2101,110 @@ impl Script {
         }
     }
 
+    fn script_local_target_from_encoded_offset(&self, raw: u32) -> Option<*const u16> {
+        let signed = raw as i32;
+        // CLEO Android stores custom-script labels as offsets whose sign must
+        // be ignored when rebasing away from CTheScripts::ScriptSpace.
+        let offset = if signed >= 0 {
+            signed as usize
+        } else {
+            signed.unsigned_abs() as usize
+        };
+
+        if offset >= self.bytes.len() {
+            return None;
+        }
+
+        Some(unsafe { self.bytes.as_ptr().add(offset).cast::<u16>() })
+    }
+
+    fn update_script_local_control_flow(&mut self, opcode: u16) -> Option<bool> {
+        const OP_J: u16 = 0x0002;
+        const OP_JT: u16 = 0x004c;
+        const OP_JF: u16 = 0x004d;
+        const OP_CALL: u16 = 0x0050;
+        const OP_RET: u16 = 0x0051;
+
+        if opcode == OP_RET {
+            if self.game.stack_pos == 0 {
+                self.stop_with_error("Script RET with empty call stack; quarantined".to_string());
+                return Some(true);
+            }
+
+            let new_pos = self.game.stack_pos as usize - 1;
+            if new_pos >= self.game.call_stack.len() {
+                self.stop_with_error("Script RET call-stack index is invalid; quarantined".to_string());
+                return Some(true);
+            }
+
+            self.game.stack_pos = new_pos as u16;
+            self.game.ip = self.game.call_stack[new_pos] as *const u16;
+            return Some(false);
+        }
+
+        if !matches!(opcode, OP_J | OP_JT | OP_JF | OP_CALL) {
+            return None;
+        }
+
+        let base = self.game.base_ip as usize;
+        let current = self.game.ip as usize;
+        let Some(offset) = current.checked_sub(base) else {
+            self.stop_with_error("Control-flow parameter pointer moved before script".to_string());
+            return Some(true);
+        };
+
+        // SA custom-script branch encoding is: type byte 0x01 + signed i32 label.
+        if offset.saturating_add(5) > self.bytes.len() {
+            self.stop_with_error(format!(
+                "Opcode {opcode:#06x} has a truncated branch parameter"
+            ));
+            return Some(true);
+        }
+
+        unsafe {
+            let p = self.game.ip.cast::<u8>();
+            let param_type = p.read();
+            if param_type != 0x01 {
+                self.stop_with_error(format!(
+                    "Opcode {opcode:#06x} expected label parameter type 0x01, got {param_type:#04x}"
+                ));
+                return Some(true);
+            }
+
+            let raw = (p.add(1) as *const u32).read_unaligned();
+            let return_ip = p.add(5).cast::<u16>();
+
+            let Some(target) = self.script_local_target_from_encoded_offset(raw) else {
+                self.stop_with_error(format!(
+                    "Opcode {opcode:#06x} label {:#x} is outside {}",
+                    raw,
+                    self.name
+                ));
+                return Some(true);
+            };
+
+            if opcode == OP_CALL {
+                let pos = self.game.stack_pos as usize;
+                if pos >= self.game.call_stack.len() {
+                    self.stop_with_error("Script CALL exceeded the 8-entry call stack".to_string());
+                    return Some(true);
+                }
+                self.game.call_stack[pos] = return_ip as usize;
+                self.game.stack_pos = (pos + 1) as u16;
+                self.game.ip = target;
+                return Some(false);
+            }
+
+            let take = opcode == OP_J
+                || (opcode == OP_JT && self.game.bool_flag)
+                || (opcode == OP_JF && !self.game.bool_flag);
+
+            self.game.ip = if take { target } else { return_ip };
+        }
+
+        Some(false)
+    }
+
     fn update_one(&mut self) -> bool {
         let Some(offset) = (self.game.ip as usize).checked_sub(self.game.base_ip as usize) else {
             self.stop_with_error("Script instruction pointer moved before start of file".to_string());
@@ -2113,13 +2217,24 @@ impl Script {
         }
 
         let op_as_written = unsafe {
-            let op = self.game.ip.read();
-            self.game.ip = self.game.ip.add(1);
+            // SCM bytecode is byte-packed; the next opcode is not guaranteed to
+            // be 16-bit aligned after variable-length parameters.
+            let p = self.game.ip.cast::<u8>();
+            let op = (p as *const u16).read_unaligned();
+            self.game.ip = p.add(2).cast::<u16>();
             op
         };
 
         self.game.not_flag = op_as_written & 0x8000 != 0;
         let opcode = op_as_written & 0x7fff;
+
+        // CLEO Android must rebase branch/call labels for custom scripts because
+        // their code is outside CTheScripts::ScriptSpace. Passing these opcodes
+        // to GTA's native handler makes non-trivial Android scripts jump into the
+        // wrong memory. Handle them exactly in our script-local allocation.
+        if let Some(can_interrupt) = self.update_script_local_control_flow(opcode) {
+            return can_interrupt;
+        }
 
         // CLEO Android replaces both ENDTHREAD (004E) and ENDCUSTOMTHREAD
         // (05DC). Never let GTA free memory owned by our Rust script object.
